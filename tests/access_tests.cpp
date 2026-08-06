@@ -5,6 +5,9 @@
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
+#include <map>
+#include <stdexcept>
+#include <string>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -17,6 +20,8 @@ namespace demo {
     using lease::access::make_rw;
     using lease::access::probe;
     using lease::access::read_lock;
+    using lease::access::indexed;
+    using lease::access::enable_locking;
     using lease::access::shared_access;
     using lease::access::exclusive_access;
 
@@ -142,6 +147,22 @@ namespace demo {
     static_assert(!lease::access::contains<float, tl>::value,
                   "contains rejects an absent type");
 
+    // ---- dedup -------------------------------------------------------------
+    using dup_list = lease::access::type_list<int, double, int, char, double>;
+    using deduped = lease::access::dedup_t<dup_list>;
+    static_assert(lease::access::type_list_size<deduped>::value == 3,
+                  "dedup removes duplicates");
+    static_assert(std::is_same<lease::access::element_at_t<0, deduped>, int>::value,
+                  "dedup keeps first occurrence order (0)");
+    static_assert(std::is_same<lease::access::element_at_t<1, deduped>, double>::value,
+                  "dedup keeps first occurrence order (1)");
+    static_assert(std::is_same<lease::access::element_at_t<2, deduped>, char>::value,
+                  "dedup keeps first occurrence order (2)");
+
+    using no_dup = lease::access::dedup_t<lease::access::type_list<>>;
+    static_assert(lease::access::type_list_size<no_dup>::value == 0,
+                  "dedup of empty list is empty");
+
 // ---- Recipe contract: explicit beats implicit ------------------------------
 // A bare recipe is single-threaded and free: no read_lock, no atomics, no
 // registry. read_lock is the explicit opt-in for the multi-threaded mode.
@@ -171,10 +192,11 @@ namespace demo {
                   "read_lock rw uses atomic writer exclusion");
 
     // A bare rw locks into a read_lock rw; the target recipe carries read_lock.
-    // lock() is callable on an lvalue (no &&): like unique_ptr::release(), the
-    // destructive conversion invalidates the source handle in place.
+    // enable_locking is callable on an lvalue (no &&): like unique_ptr::release(),
+    // the destructive conversion invalidates the source handle in place.
     static_assert(std::is_same<
-                          decltype(std::declval<exclusive_access<widget>&>().lock()),
+                          decltype(lease::access::enable_locking(
+                              std::declval<exclusive_access<widget>&>())),
                           locked_rw>::value,
                   "bare rw locks into read_lock rw");
 
@@ -202,8 +224,8 @@ namespace demo {
             // Lock: bare rw -> read_lock rw. Destructive; the old handle hands
             // over root ownership and is invalidated. No std::move needed.
             // (The derived ro above is out of scope here — the orphan-reader
-            // contract requires it destroyed before lock().)
-            auto locked = rw.lock();
+            // contract requires it destroyed before enable_locking.)
+            auto locked = enable_locking(rw);
             assert(!rw);
 
             locked->set(3);                 // locked write: CAS enforced now
@@ -410,6 +432,109 @@ namespace demo {
         std::puts("concurrency_test OK");
     }
 
+// ---- indexed decorator tests -----------------------------------------------
+
+    // Compile-time: indexed detects map vs sequence vs non-indexable.
+    static_assert(lease::access::detail::map_key<std::map<int, int>>::value,
+                  "map_key detects std::map");
+    static_assert(lease::access::detail::has_index_access<std::vector<int>>::value,
+                  "has_index_access detects std::vector");
+    static_assert(!lease::access::detail::is_indexable<widget>::value,
+                  "widget is not indexable");
+    static_assert(lease::access::detail::is_indexable<std::vector<int>>::value,
+                  "vector is indexable");
+    static_assert(lease::access::detail::is_indexable<std::map<std::string, int>>::value,
+                  "map is indexable");
+
+    // Compile-time: key_type resolution.
+    static_assert(std::is_same<
+                      lease::access::detail::index_key<std::vector<int>>::type,
+                      std::size_t>::value,
+                  "vector key is size_t");
+    static_assert(std::is_same<
+                      lease::access::detail::index_key<std::map<std::string, int>>::type,
+                      std::string>::value,
+                  "map key is key_type");
+
+    void indexed_test() {
+        // --- Sequence path: vector ---
+        {
+            std::vector<int> vals{10, 20, 30, 40, 50};
+            auto rw = make_rw<indexed>(vals);
+
+            // Write through write_arrow (rw_tag pass-through).
+            rw->operator[](0) = 99;
+            assert(vals[0] == 99);
+
+            // Read through indexed operator[] on shared_access.
+            auto ro = rw.borrow_ro();
+            assert(ro[0] == 99);
+            assert(ro[4] == 50);
+
+            // Borrowed ro copy also works.
+            auto ro2 = ro;
+            assert(ro2[2] == 30);
+        }
+
+        // --- Map path: forwards to at(), not operator[] ---
+        {
+            std::map<std::string, int> m{{"alpha", 1}, {"beta", 2}, {"gamma", 3}};
+            auto rw = make_rw<indexed>(m);
+
+            // Write through write_arrow (real map::operator[], inserts).
+            rw->operator[]("delta") = 4;
+            assert(m.at("delta") == 4);
+
+            // Read through indexed operator[] on shared_access.
+            // This forwards to at() — safe on const map, throws on missing key.
+            auto ro = rw.borrow_ro();
+            assert(ro["alpha"] == 1);
+            assert(ro["beta"] == 2);
+            assert(ro["delta"] == 4);
+
+            // at() throws on missing key — no silent insertion.
+            bool threw = false;
+            try {
+                (void)ro["missing"];
+            } catch (const std::out_of_range&) {
+                threw = true;
+            }
+            assert(threw);
+        }
+
+        // --- Non-indexable type: operator[] does not exist ---
+        // (If it did, this function would not compile. The static_assert
+        //  above already proves widget is not indexable. Here we just
+        //  verify the proxy compiles and works normally without []. )
+        {
+            widget w;
+            w.value = 42;
+            auto ro = make_ro<indexed>(w);
+            assert(ro->get() == 42);
+        }
+
+        // --- Works with read_lock recipe ---
+        {
+            std::vector<int> vals{100, 200, 300};
+            auto rw = make_rw<read_lock, indexed>(vals);
+            auto ro = rw.borrow_ro();
+            assert(ro[0] == 100);
+            assert(ro[1] == 200);
+            assert(ro[2] == 300);
+        }
+
+        // --- Duplicate decorator: <indexed, indexed> collapses to one layer ---
+        {
+            std::vector<int> vals{7, 8, 9};
+            auto rw = make_rw<indexed, indexed>(vals);
+            auto ro = rw.borrow_ro();
+            assert(ro[0] == 7);
+            assert(ro[2] == 9);
+        }
+
+        std::puts("indexed_test OK");
+    }
+
 } // namespace demo
 
 int main() {
@@ -419,6 +544,7 @@ int main() {
     demo::last_closer_test();
     demo::shallow_span_test();
     demo::concurrency_test();
+    demo::indexed_test();
 
 #if LSE_ACCESS_CHECKING && defined(LSE_ACCESS_VIOLATION)
     demo::widget w;

@@ -59,9 +59,10 @@ namespace access {
 // CAS exclusion.
 //
 // Lock rule (compile-time enforced):
-//   an exclusive_access without read_lock may lock() into a locked one; a
-//   locked exclusive_access has no lock() member at all (SFINAE) and no
-//   reverse conversion exists — it can never silently weaken back.
+//   an exclusive_access without read_lock may be passed to enable_locking()
+//   to obtain a locked one; calling enable_locking() on an already-locked
+//   proxy triggers a static_assert, and no reverse conversion exists — it
+//   can never silently weaken back.
 // ============================================================
         template <typename Inner, typename Policy>
         class read_lock_impl;
@@ -124,10 +125,148 @@ namespace access {
             using apply = read_lock_impl<Inner, Policy>;
         };
 
-// lock() target recipe: the source recipe plus read_lock at the head.
+// enable_locking() target recipe: the source recipe plus read_lock at the head.
         template <typename L>
         struct lock_list {
             using type = typename prepend<read_lock, L>::type;
+        };
+
+// ============================================================
+// indexed decorator: conditional operator[] forwarding.
+//
+// Adds operator[] to shared_access<T> when T supports indexing.
+// Detection priority:
+//   1. T::key_type exists → map-like, forwards to at(key_type)
+//      (map::operator[] is non-const and inserts; at() is the
+//       const-safe lookup that throws instead of silently inserting)
+//   2. T supports operator[](size_t) → sequence-like, direct forward
+//   3. Neither → operator[] does not exist (SFINAE, zero cost)
+//
+// Shallow: forwards to T's own indexing, returning T's own reference
+// type. Does not wrap elements in capabilities.
+//
+// ro_tag only: reader-preference protocol blocks writers, so const
+// element access is safe without additional synchronization. For
+// rw_tag, use rw->operator[](key) through write_arrow, which handles
+// writer exclusion correctly.
+// ============================================================
+        namespace detail {
+
+            // Priority 1: T has key_type (map-like containers).
+            template <typename T, typename = void>
+            struct map_key { static constexpr bool value = false; };
+            template <typename T>
+            struct map_key<T, void_t<typename T::key_type>> {
+                static constexpr bool value = true;
+                using type = typename T::key_type;
+            };
+
+            // Priority 2: T supports operator[](size_t) (sequence containers).
+            template <typename T, typename = void>
+            struct has_index_access : std::false_type {};
+            template <typename T>
+            struct has_index_access<T, void_t<
+                decltype(std::declval<const T&>()[std::size_t{}])
+            >> : std::true_type {};
+
+            // Combined: does T support any form of indexing?
+            template <typename T>
+            struct is_indexable {
+                static constexpr bool value =
+                    map_key<T>::value || has_index_access<T>::value;
+            };
+
+            // Key type resolver: map_key::type if available, else size_t.
+            template <typename T, bool IsMap = map_key<T>::value>
+            struct index_key { using type = std::size_t; };
+            template <typename T>
+            struct index_key<T, true> { using type = typename map_key<T>::type; };
+
+            // Tag-dispatch helper: index a const T by key.
+            // Map path forwards to at() (const-safe, throws on missing key);
+            // sequence path forwards to operator[] (const overload exists).
+            template <typename T, typename Key>
+            auto do_index(const T& obj, Key&& k, std::true_type /*is_map*/)
+                -> decltype(obj.at(std::forward<Key>(k))) {
+                return obj.at(std::forward<Key>(k));
+            }
+
+            template <typename T, typename Key>
+            auto do_index(const T& obj, Key&& k, std::false_type /*is_map*/)
+                -> decltype(obj[std::forward<Key>(k)]) {
+                return obj[std::forward<Key>(k)];
+            }
+
+        } // namespace detail
+
+        // Primary template — undefined. Specialized below.
+        template <typename Inner, typename Policy, typename = void>
+        class indexed_impl;
+
+        // ro_tag + indexable T: adds operator[].
+        template <typename Inner>
+        class indexed_impl<Inner, ro_tag,
+                std::enable_if_t<detail::is_indexable<typename Inner::value_type>::value>>
+            : public Inner {
+        public:
+            using value_type = typename Inner::value_type;
+            using policy_type = ro_tag;
+            using key_type = typename detail::index_key<value_type>::type;
+
+            using Inner::Inner;
+            indexed_impl(const indexed_impl&) noexcept = default;
+            indexed_impl(indexed_impl&&) noexcept = default;
+            indexed_impl& operator=(const indexed_impl&) = delete;
+            indexed_impl& operator=(indexed_impl&&) = delete;
+
+            // Single operator[] — tag dispatch picks at() for maps (const-safe)
+            // and operator[] for sequences (const overload exists).
+            auto operator[](key_type k) const
+                -> decltype(detail::do_index(
+                        std::declval<const value_type&>(),
+                        std::declval<key_type>(),
+                        std::integral_constant<bool, detail::map_key<value_type>::value>{})) {
+                const value_type* obj = this->const_object();
+                if (!obj) {
+                    contract_violation("indexing through an empty shared_access");
+                }
+                return detail::do_index(*obj, std::move(k),
+                        std::integral_constant<bool, detail::map_key<value_type>::value>{});
+            }
+        };
+
+        // ro_tag + non-indexable T: pass-through, no operator[].
+        template <typename Inner>
+        class indexed_impl<Inner, ro_tag,
+                std::enable_if_t<!detail::is_indexable<typename Inner::value_type>::value>>
+            : public Inner {
+        public:
+            using value_type = typename Inner::value_type;
+            using policy_type = ro_tag;
+            using Inner::Inner;
+            indexed_impl(const indexed_impl&) noexcept = default;
+            indexed_impl(indexed_impl&&) noexcept = default;
+            indexed_impl& operator=(const indexed_impl&) = delete;
+            indexed_impl& operator=(indexed_impl&&) = delete;
+        };
+
+        // rw_tag: always pass-through. For indexed write access, use
+        // rw->operator[](key) through write_arrow (writer exclusion).
+        template <typename Inner, typename V>
+        class indexed_impl<Inner, rw_tag, V> : public Inner {
+        public:
+            using value_type = typename Inner::value_type;
+            using policy_type = rw_tag;
+            using Inner::Inner;
+            indexed_impl(const indexed_impl&) noexcept = default;
+            indexed_impl(indexed_impl&&) noexcept = default;
+            indexed_impl& operator=(const indexed_impl&) = delete;
+            indexed_impl& operator=(indexed_impl&&) = delete;
+        };
+
+        struct indexed {
+            template <typename Inner, typename Policy>
+            using apply = indexed_impl<Inner, Policy>;
         };
 
 // ============================================================
@@ -137,9 +276,6 @@ namespace access {
 // file without a passing decorator_probe static_assert is a build error.
 // ============================================================
         namespace detail {
-
-            template <typename...>
-            using void_t = void;  // C++14 void_t
 
             // 1. The recipe seam must exist: D::template apply<Inner, Policy>.
             template <typename D, typename Inner, typename Policy, typename = void>
@@ -230,6 +366,10 @@ namespace access {
                       "read_lock must satisfy the decorator contract");
         static_assert(decorator_probe<probe, int, ro_tag>::value,
                       "probe must satisfy the decorator contract");
+        static_assert(decorator_probe<indexed, int, ro_tag>::value,
+                      "indexed must satisfy the decorator contract (non-indexable T)");
+        static_assert(decorator_probe<indexed, int, rw_tag>::value,
+                      "indexed must satisfy the decorator contract (rw_tag pass-through)");
 
 } // namespace access
 } // namespace lease

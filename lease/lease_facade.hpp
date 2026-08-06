@@ -10,7 +10,7 @@
 //   - shared_access / exclusive_access aliases
 //   - make_ro / make_rw factories
 //
-// Destructive conversions (lock(), downgrade()) take no &&: like
+// Destructive conversions (enable_locking(), downgrade()) take no &&: like
 // unique_ptr::release(), they are callable on lvalues, invalidate the source
 // handle immediately, and any later use of that handle is a contract
 // violation — never silent UB.
@@ -52,12 +52,22 @@ namespace access {
 
         template <typename T, typename Policy, typename... Nodes>
         struct materialize_recipe<T, Policy, type_list<Nodes...>> {
-            using type = typename materialize_nodes<
-                    T,
-                    Policy,
-                    Nodes...,
-                    track,
-                    object_leaf>::type;
+            // Instantiation gate: assemble the full recipe (user decorators +
+            // mandatory track + object_leaf), then dedup. This is the single
+            // convergence point — every recipe path (direct user, lock_list
+            // prepend, future auto-inject) flows through here, so dedup at this
+            // layer catches all duplicates regardless of origin.
+            // First occurrence wins: user-declared decorators are authoritative
+            // over any auto-injected ones.
+            using raw = type_list<Nodes..., track, object_leaf>;
+            using recipe = dedup_t<raw>;
+            // Unpack the deduped type_list back into variadic args for
+            // materialize_nodes.
+            template <typename R> struct unpack;
+            template <typename... Rs> struct unpack<type_list<Rs...>> {
+                using type = typename materialize_nodes<T, Policy, Rs...>::type;
+            };
+            using type = typename unpack<recipe>::type;
         };
 
         template <typename T,
@@ -71,6 +81,9 @@ namespace access {
 
             // The recipe is exactly what the user wrote: bare = single-threaded
             // (free), read_lock = multi-threaded (atomic). No implicit layers.
+            // Dedup happens at the instantiation point (materialize_recipe),
+            // not here — so every recipe path (direct, lock_list, future
+            // auto-inject) converges through the same dedup gate.
             using type = typename materialize_recipe<
                     T, Policy, type_list<Decorators...>>::type;
         };
@@ -353,47 +366,6 @@ namespace access {
                 return result;
             }
 
-            // Lock: bare -> locked. Destructive: this proxy hands its root
-            // ownership to the returned locked proxy and is invalidated. No &&
-            // needed: the source handle is dead after the call and any later use
-            // trips a contract violation (see downgrade() for the same rule).
-            //
-            // SFINAE, not static_assert: the method exists only when the recipe
-            // has no read_lock. A locked proxy structurally has no lock() — it
-            // cannot re-lock, and no downgrade path exists either (the locked
-            // recipe declares no reverse conversion). The single-thread promise
-            // therefore cannot be silently weakened at any later call site.
-            //
-            // This is the lazy-lineage seam: the shared era (heap control block,
-            // atomics, registry entry) begins exactly here. lineage_control's
-            // constructor registers with the root_registry, so a second bare
-            // root locking the same referent aborts in Debug (single-lineage
-            // guarantee). Release builds skip that check by contract.
-            //
-            // Orphan-reader contract: any shared_access derived from this proxy
-            // before lock() (via borrow_ro) must be destroyed first. Such readers
-            // contribute no count to the locked protocol, so a live one would be
-            // an uncounted participant racing the new writer. Single-threaded
-            // code is safe by construction; crossing into the shared era with a
-            // live uncounted reader is a contract violation.
-            template <typename L = DecoratorList,
-                    std::enable_if_t<!contains<read_lock, L>::value, int>* = nullptr>
-            auto lock() -> proxy<T, typename lock_list<L>::type, rw_tag> {
-                using locked_proxy = proxy<T, typename lock_list<L>::type, rw_tag>;
-
-                T* object = this->mutable_object();
-                if (!object) {
-                    contract_violation("locking an empty exclusive_access");
-                }
-
-                auto owner = std::make_unique<lineage_control>(object);
-                lineage_control* control = owner.get();
-                locked_proxy result(
-                        root_construct_tag{}, object, control, std::move(owner));
-                this->invalidate();
-                return result;
-            }
-
             explicit operator bool() const noexcept { return this->valid_object(); }
 
         private:
@@ -409,6 +381,13 @@ namespace access {
 
             template <typename U, bool L>
             friend class write_arrow;
+
+            // Grant enable_locking access to private constructors across
+            // all proxy instantiations (source bare + target locked).
+            template <typename T2, typename... Ds2>
+            friend auto enable_locking(
+                proxy<T2, type_list<Ds2...>, rw_tag>&) noexcept
+                -> proxy<T2, typename lock_list<type_list<Ds2...>>::type, rw_tag>;
 
             template <typename... Decorators, typename U>
             friend auto make_rw(U& object)
@@ -436,7 +415,8 @@ namespace access {
 
             // A bare root (no read_lock) defers the shared era entirely: no
             // heap control block, no atomics, no registry entry. The lineage is
-            // created lazily if/when an exclusive root lock()s into locked.
+            // created lazily if/when an exclusive root is passed to
+            // enable_locking() to enter the locked (shared) era.
             constexpr bool free =
                     !contains<read_lock, type_list<Decorators...>>::value;
             if (free) {
@@ -484,6 +464,61 @@ namespace access {
                     std::addressof(object),
                     control,
                     std::move(owner));
+        }
+
+// ============================================================
+// enable_locking: bare exclusive_access -> locked exclusive_access.
+//
+// Destructive: the source proxy hands its root ownership to the returned
+// locked proxy and is invalidated. No && needed — like unique_ptr::release(),
+// the source handle is dead after the call and any later use trips a
+// contract violation.
+//
+// Why static_assert, not SFINAE: this free function needs a friend declaration
+// to reach the private root-construct constructor. Empirically (tested, g++):
+//   - enable_if as a defaulted template param on the function  -> AMBIGUOUS:
+//     the friend decl (no defaulted param) and the definition become two
+//     distinct templates, both candidates;
+//   - mirroring the enable_if onto the friend decl              -> ILLEGAL:
+//     "default template arguments may not be used in template friend
+//     declarations" (hard language rule);
+//   - enable_if in the trailing return type                     -> AMBIGUOUS:
+//     same split — friend names proxy<...> return, defn names enable_if_t<...>.
+// SFINAE alters the function template's signature; friend matching requires
+// identical signatures; the two are in direct conflict for one function. The
+// member lock() could SFINAE (members befriend themselves), but a .lock()
+// method on a *bare* (lock-free) proxy is misleading, so this is a free
+// function + static_assert instead. The static_assert also gives a clearer
+// message than "no matching function" would.
+//
+// This is the lazy-lineage seam: the shared era (heap control block,
+// atomics, registry entry) begins exactly here. lineage_control's constructor
+// registers with the root_registry, so a second bare root locking the same
+// referent aborts in Debug. Release builds skip that check by contract.
+//
+// Orphan-reader contract: any shared_access derived from the source proxy
+// before enable_locking (via borrow_ro) must be destroyed first.
+// ============================================================
+        template <typename T, typename... Decorators>
+        auto enable_locking(
+            proxy<T, type_list<Decorators...>, rw_tag>& rw) noexcept
+            -> proxy<T, typename lock_list<type_list<Decorators...>>::type, rw_tag> {
+            static_assert(!contains<read_lock, type_list<Decorators...>>::value,
+                          "enable_locking requires a bare (unlocked) exclusive_access");
+            using locked_proxy =
+                proxy<T, typename lock_list<type_list<Decorators...>>::type, rw_tag>;
+
+            T* object = rw.mutable_object();
+            if (!object) {
+                contract_violation("locking an empty exclusive_access");
+            }
+
+            auto owner = std::make_unique<lineage_control>(object);
+            lineage_control* control = owner.get();
+            locked_proxy result(
+                    root_construct_tag{}, object, control, std::move(owner));
+            rw.invalidate();
+            return result;
         }
 
 } // namespace access
