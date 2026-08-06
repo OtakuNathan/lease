@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        compiler: [gcc, clang]
+        build_type: [Debug, Release]
+        exclude:
+          - os: macos-latest
+            compiler: gcc
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up compiler
+        if: matrix.os == 'ubuntu-latest' && matrix.compiler == 'clang'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang
+
+      - name: Configure CMake
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+                -DCMAKE_CXX_COMPILER=${{ matrix.compiler == 'gcc' && 'g++' || 'clang++' }}
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Run contract tests
+        run: ./build/tests/access_tests
+
+      - name: Run pool stress tests
+        run: ./build/tests/pool_stress_tests
+
+  tsan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: TSan — contract tests
+        run: |
+          g++ -std=c++17 -O1 -fsanitize=thread -Ilease \
+              tests/access_tests.cpp -pthread -o /tmp/access_tsan
+          /tmp/access_tsan
+
+      - name: TSan — pool stress tests
+        run: |
+          g++ -std=c++17 -O1 -fsanitize=thread -Ilease \
+              tests/pool_stress_tests.cpp -pthread -o /tmp/pool_tsan
+          /tmp/pool_tsan
+
+  tla:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Download TLA+ tools
+        run: |
+          wget -q https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+          echo "TLA_JAR=tla2tools.jar" >> $GITHUB_ENV
+
+      - name: Run TLC — ParticipantCount
+        run: |
+          cd tla && java -cp ../${{ env.TLA_JAR }} tlc2.TLC ParticipantCount.tla
+
+      - name: Run TLC — ParticipantCountRefined
+        run: |
+          cd tla && java -cp ../${{ env.TLA_JAR }} tlc2.TLC ParticipantCountRefined.tla

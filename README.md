@@ -41,9 +41,53 @@ does not need it.
 The design principle is the same one that runs through everything here:
 
 > **Explicit beats implicit.** A bare recipe is single-threaded and free.
-> You say `read_lock` when you mean shared. You call `lock()` when you cross
-> into the multi-threaded world. Nothing is done for you silently, because
-> silent behavior is how C++ gets you.
+> You say `read_lock` when you mean shared. You call `enable_locking()` when
+> you cross into the multi-threaded world. Nothing is done for you silently,
+> because silent behavior is how C++ gets you.
+
+## Design philosophy
+
+lease is **best-effort authority modeling**. It makes read/write authority a
+first-class type, enforces what it can at compile time, checks what it can in
+Debug, and charges nothing for what you don't ask for. But it cannot do what
+only a compiler can do — it cannot ban raw pointer arithmetic, cannot prevent
+`const_cast`, cannot stop you from keeping a `T*` next to the proxy. Those
+powers belong to the language, not the library.
+
+**Preconditions (caller's responsibility):**
+
+- The referent object outlives all proxies that reference it.
+- The referent's address is stable for the duration of every lease.
+- All access to the referent goes through the same lease domain (one lineage
+  per object).
+
+**What lease guarantees (within a single domain):**
+
+- Read/write authority is expressed in the type: `exclusive_access<T>` vs
+  `shared_access<T>`.
+- Read authority (`shared_access`) may be shared — copied freely.
+- Write authority (`exclusive_access`) may only be transferred (move), never
+  copied or rebound.
+- Debug builds verify single-lineage provenance and catch use-after-invalidate.
+- The optional `read_lock` decorator provides an intrusive refcount model:
+  one atomic counter tracks all live proxies (rw + ro copies). Writing
+  requires refcount == 1 (only the rw holder); writing while readers are
+  active is a contract violation (always checked — abort in both Debug
+  and Release).
+- Every additional protection is purchased explicitly via a decorator — the
+  single-threaded bare path pays for nothing it does not use.
+
+**What lease cannot do:**
+
+- It cannot prevent the caller from holding a raw `T*` alongside the proxy and
+  writing through it.
+- It cannot enforce that all access goes through lease — the compiler grants
+  raw access; the library cannot revoke it.
+- It cannot guarantee lifetime if the caller violates the preconditions.
+
+This is the honest contract: lease gives you the tools to express authority
+correctly, and the compiler will catch the mistakes it can see. The rest is
+discipline.
 
 ## Why not `T&` / `const T&`?
 
@@ -74,14 +118,15 @@ touch it?" — and conflating the two is how ownership bugs happen.
   the interesting question became "is a writer in flight?"
 - lease separates the two cleanly: the **root** owns the control block
   (lifetime), and the **lease** carries the access mode (authority).
-  Lifetime ends by last-closer, not by a counter that everyone can bump.
+  Lifetime ends by last-closer (refcount reaches 0), not by a
+  counter that everyone can bump.
 
 | | `shared_ptr` | lease |
 |---|---|---|
 | What it tracks | lifetime | authority |
 | Write access | everyone | only `exclusive_access` |
 | Cost of a share | atomic RMW (always) | plain copy (bare) or atomic RMW (locked) |
-| Who can delete | last shared_ptr | root, or last reader by protocol |
+| Who can delete | last shared_ptr | last participant (refcount → 0) |
 
 ## Why not a mutex wrapper?
 
@@ -89,17 +134,18 @@ Because a mutex is a *schedule*, not a *type*. Wrapping an object in a
 mutex protects each access *moment*; it says nothing about **who may** do
 anything, and it taxes every call site whether or not there is contention.
 
-lease compiles the exclusion into the type and charges you only for what
+lease compiles the authority into the type and charges you only for what
 you asked for:
 
 | Path | What you pay |
 |---|---|
 | bare recipe | nothing — a store, a load, a member copy |
-| `read_lock` recipe | one atomic RMW per borrow, CAS per write |
+| `read_lock` recipe | one atomic RMW per participant add/remove; write is an always-compiled refcount check |
 
-The same `rw->set(7)` expression compiles to a **single store** in a bare
-recipe and a **CAS protocol** in a locked one — chosen at compile time, by
-the type, not by a runtime lock we carry everywhere "just in case."
+The same `rw->set(7)` expression compiles to a **single store** in both
+bare and locked recipes (Release). The locked recipe adds an
+always-compiled `refcount == 1` check (one atomic load) — no CAS, no
+spin, no backoff. The count IS the lock.
 
 ## Quick start
 
@@ -120,15 +166,24 @@ int main() {
     rw->set(42);
     assert(w.value == 42);
 
-    auto ro = rw.borrow_ro();            // a read share; must die before lock()
-    assert(ro->get() == 42);
-
-    // Cross the boundary: lock() starts the shared era (heap control block,
-    // atomics, registry entry). Explicit, one-way, irreversible.
+    // Borrow a read share. In bare mode this is free (no atomics).
+    // ro MUST die before enable_locking() — the orphan-reader contract.
     {
-        auto locked = rw.lock();
+        auto ro = rw.borrow_ro();
+        assert(ro->get() == 42);
+    }
+
+    // Cross the boundary: enable_locking() starts the shared era (heap control
+    // block, atomics, registry entry). Explicit, one-way, irreversible.
+    {
+        auto locked = lease::access::enable_locking(rw);
         locked->set(7);
-    }   // locked root is released here; one lineage per object
+
+        auto locked_ro = locked.borrow_ro();   // counted: refcount = 2
+        assert(locked_ro->get() == 7);
+        // locked_ro dies here → refcount back to 1
+    }
+    // locked root is released here; refcount → 0 → control block self-deletes
 
     // Multi-threaded from the start: say so explicitly.
     auto shared = lease::access::make_rw<lease::access::read_lock>(w);
@@ -141,6 +196,70 @@ Function signatures carry the mode, so no `&`, `const&`, or `&&`:
 ```cpp
 int read_total(shared_access<widget> ro);       // "I only read"
 void write(exclusive_access<widget> rw);        // "I take the authority"
+```
+
+### Scoped read/write lambdas
+
+For multi-step mutations (e.g. `std::sort`), use `.write(lambda)` to make
+the write intent visible and prevent references from escaping:
+
+```cpp
+rw.write([&](std::vector<int>& v) {
+    std::sort(v.begin(), v.end());    // safe: no readers can exist
+});
+
+int first = ro.read([&](const std::vector<int>& v) {
+    return v.front();                 // const T&, cannot outlive the call
+});
+```
+
+The lambda receives `T&` (or `const T&` for read). No iterator or pointer
+can escape the scope. `noexcept` propagates from the lambda.
+
+### Unified write path
+
+All write operations — `operator->`, `.write(lambda)`, `.assign()`, and
+`operator=(T)` — go through a single admission gate (`write_arrow`):
+
+```
+operator->      ─┐
+write(lambda)   ─┤
+assign()        ─┼──→ write_arrow ──→ core_valid → exclusivity → decorator seam
+operator=(T)    ─┘
+```
+
+The admission check runs in a fixed order:
+
+1. **`core_valid()`** — spent-token check via `object_storage` directly
+   (not through the decorator chain). A spent proxy aborts here.
+2. **Exclusivity** — `refcount == 1` via `core_control()` (root_slot's
+   authoritative pointer). Always compiled (one atomic load).
+3. **Decorator seam** — `mutable_write_object()` is called only after
+   admission passes, so decorator side effects (audit counters, etc.)
+   never fire on a rejected write.
+
+### Reentrancy contract
+
+`borrow_ro()` must NOT be called from inside a write expression
+(`operator->`, `.write(lambda)`, `.assign()`). The rw holder is the only
+thread that can create the first ro, so no external thread can violate
+this — but the rw holder itself can reenter. Doing so creates a reader
+during a write, which the next `write_arrow` catches (`refcount > 1` →
+abort). This is a contract violation, not a runtime-synchronized path.
+
+### Container indexing
+
+`shared_access<T>` automatically gets `operator[]` when T supports it —
+no explicit decorator needed:
+
+```cpp
+auto rw = make_rw(vec);
+auto ro = rw.borrow_ro();
+assert(ro[0] == 42);              // auto-injected, forwards to vec::operator[]
+
+auto mrw = make_rw(mymap);
+auto mro = mrw.borrow_ro();
+assert(mro["key"] == 1);          // forwards to map::at() — const-safe, no silent insert
 ```
 
 ## The cost model, measured
@@ -156,32 +275,43 @@ The *shape* is what matters:
 
 | case | ns/op |
 |---|---|
-| read: lease bare | **1.1** |
-| read: shared_ptr copy | 15.9 |
-| read: lease read_lock | 41.4 |
-| read: std::shared_mutex | 49.2 |
+| read: lease bare | **1.7** |
+| read: shared_ptr copy | 16.1 |
+| read: lease read_lock | 37.3 |
+| read: std::shared_mutex | 48.8 |
 | write: lease bare | **1.1** |
-| write: lease read_lock | 41.4 |
-| write: std::shared_mutex | 77.3 |
+| write: lease read_lock | **8.2** |
+| write: std::shared_mutex | 73.8 |
+| root create+destroy: lease | **40.7** |
+| root create+destroy: shared_ptr | 57.7 |
 
-The bare path is within noise of a bare reference. The locked path beats a
-`shared_mutex` on both read and write — one packed atomic word vs. a mutex
-state machine.
+The bare path is within noise of a bare reference. The locked write path is
+**8.2 ns** — 9× faster than `std::shared_mutex` — because the intrusive refcount
+model has no CAS loop, no spin, no backoff. The count IS the lock:
+`refcount == 1` means exclusive, always checked.
+
+Root creation+destruction is **40.7 ns** — faster than `std::shared_ptr`
+(57.7 ns) — because `lineage_control` uses a pooled allocator (thread-local
+cache → lock-free slab → malloc fallback) borrowed from flux_foundry.
 
 ### Debug checking is real, and it stays out of the hot path
 
 `LSE_ACCESS_CHECKING` (on unless `NDEBUG`) tracks root provenance in a
-global registry. Its cost is a **root-lifecycle tax**, not a per-access tax:
+global registry (single-lineage guarantee). Its cost is a
+**root-lifecycle tax**, not a per-access tax:
 
 | case | release | debug |
 |---|---|---|
-| root create + destroy | 104 ns | 246 ns |
-| read: lease bare | 1.12 ns | 1.12 ns |
-| read: lease read_lock | 41.4 ns | 41.0 ns |
+| root create + destroy | 40.7 ns | 1539 ns |
+| read: lease bare | 1.7 ns | 59.1 ns |
+| read: lease read_lock | 37.3 ns | 121.2 ns |
+| write: lease read_lock | 8.2 ns | 56.2 ns |
 
 Creating a root in Debug pays the global mutex + hash map entry; **the hot
-paths are unchanged**. You pay for checking exactly where checking happens —
-at the boundaries, not in the loop.
+paths are unchanged**. Write exclusivity (`is_exclusive()`) is always
+compiled — a single atomic load, invisible in benchmark noise. The
+Debug-only cost is the root_registry provenance check, not the
+exclusivity check.
 
 ## What the compiler refuses (read this, it's the best part)
 
@@ -193,28 +323,50 @@ messages in [`docs/negative_examples.cpp`](docs/negative_examples.cpp).
 auto rw2 = rw;              // ERROR: deleted — write authority is unique
 auto rw2 = std::move(rw);   // OK: transferred, then rw is spent
 shared_access<widget> ro = rw;   // ERROR: no implicit downgrade
-auto again = locked.lock();      // ERROR: no such member (SFINAE)
+auto again = enable_locking(locked);   // ERROR: static_assert — already locked
 ```
 
-And in Debug builds:
+And at runtime (always checked, both Debug and Release):
 
 ```cpp
-make_rw<read_lock>(w); make_ro<read_lock>(w);   // abort: two roots, one object
-rw->set(1);  rw->set(1);  // after std::move(rw): abort: empty handle used
+make_rw<read_lock>(w); make_ro<read_lock>(w);   // abort: two roots, one object (Debug only)
+rw->set(1);  rw->set(1);  // after std::move(rw): abort: spent handle used
+rw->set(1);               // after borrow_ro(): abort: write while readers active
 ```
 
 A program that cannot compile cannot ship. The more lease moves into the
 type system, the less it needs to check at runtime — and what remains is
 checked loudly, with a message, never silently.
 
+## Formal verification
+
+The intrusive refcount model is verified with TLA+ (see `tla/ParticipantCount.tla`
+and `tla/ParticipantCountRefined.tla`). TLC checks invariants over all
+reachable states:
+
+- **WriteExclusion**: `writing => count = 1` — a write expression implies
+  exclusive access.
+- **NoUnderflow**: `count >= 0` — the participant count never goes negative.
+- **TerminalOK**: `count = 0 => ~writing` — the terminal state is clean.
+
+```
+Model checking completed. No error has been found.
+  5 distinct states found, 0 states left on queue.
+```
+
 ## The ideas behind it
 
 - [`docs/architecture.md`](docs/architecture.md) — how Facade, Decorator,
   Lease, Control Block, Resource, and Policy relate, with the ownership and
-  happens-before diagrams.
+  lifetime diagrams.
 - [`docs/negative_examples.cpp`](docs/negative_examples.cpp) — illegal
   programs, compile-time and runtime, with the real errors they produce.
 - [`bench/bench.cpp`](bench/bench.cpp) — the measured cost model above.
+- [`tla/ParticipantCount.tla`](tla/ParticipantCount.tla) — TLA+ spec and
+  TLC verification of the intrusive refcount model.
+- [`tla/ParticipantCountRefined.tla`](tla/ParticipantCountRefined.tla) —
+  Refined model with ghost state proving the refcount refines the full
+  authority state machine.
 
 ## Layout
 
@@ -222,13 +374,14 @@ checked loudly, with a message, never silently.
 lease.hpp                 facade header — the only public entry point
 lease_type_list.hpp       compile-time type-list IR (flat inheritance, O(1)
                           element_at — borrowed from dynabridge/type_list.h)
-lease_storage.hpp         layer 1: storage, lineage control, mandatory track
-lease_decorators.hpp      layer 2: decorators + decorator contract probe
+lease_storage.hpp         layer 1: intrusive refcount control block, track
+lease_decorators.hpp      layer 2: read_lock, indexed, decorator contract probe
                           (the extension point)
-lease_facade.hpp          layer 3: proxies, factories, writer exclusion
+lease_facade.hpp          layer 3: proxies, factories, write_arrow
 tests/                    contract tests and examples
 docs/                     architecture, negative examples
 bench/                    the cost model, measured
+tla/                      TLA+ spec and verification
 ```
 
 ## Requirements
@@ -236,3 +389,5 @@ bench/                    the cost model, measured
 - C++14 or newer (benchmark uses C++17 for `std::shared_mutex`)
 - Standard library only — no Boost, no external dependencies
 - CMake 3.20+ optional; every header works standalone
+- Java 11+ + [TLA+ tools](https://github.com/tlaplus/tlaplus) optional; only
+  needed to re-run formal verification

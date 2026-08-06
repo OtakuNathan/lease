@@ -1,11 +1,11 @@
-// lease_facade.hpp — Layer 3: proxy facades, factories, writer exclusion.
+// lease_facade.hpp — Layer 3: proxy facades, factories, write_arrow.
 //
 // Internal header: include via lease.hpp only.
 //
 // This layer consumes the layers below and presents the public surface:
 //   - materialize_*  : turns a recipe (type_list of decorators) into the final
 //                      impl type
-//   - writer_scope / write_arrow : per-expression writer exclusion
+//   - write_arrow    : per-expression referent resolution + exclusivity check
 //   - proxy<T, DecoratorList, ro_tag|rw_tag> : the shared/exclusive facades
 //   - shared_access / exclusive_access aliases
 //   - make_ro / make_rw factories
@@ -52,17 +52,11 @@ namespace access {
 
         template <typename T, typename Policy, typename... Nodes>
         struct materialize_recipe<T, Policy, type_list<Nodes...>> {
-            // Instantiation gate: assemble the full recipe (user decorators +
-            // mandatory track + object_leaf), then dedup. This is the single
-            // convergence point — every recipe path (direct user, lock_list
-            // prepend, future auto-inject) flows through here, so dedup at this
-            // layer catches all duplicates regardless of origin.
-            // First occurrence wins: user-declared decorators are authoritative
-            // over any auto-injected ones.
-            using raw = type_list<Nodes..., track, object_leaf>;
-            using recipe = dedup_t<raw>;
-            // Unpack the deduped type_list back into variadic args for
-            // materialize_nodes.
+            using pre_dedup = std::conditional_t<
+                detail::is_indexable<T>::value,
+                type_list<Nodes..., indexed, track, object_leaf>,
+                type_list<Nodes..., track, object_leaf>>;
+            using recipe = dedup_t<pre_dedup>;
             template <typename R> struct unpack;
             template <typename... Rs> struct unpack<type_list<Rs...>> {
                 using type = typename materialize_nodes<T, Policy, Rs...>::type;
@@ -79,11 +73,6 @@ namespace access {
             static_assert(!contains<object_leaf, type_list<Decorators...>>::value,
                           "object_leaf is an internal sentinel");
 
-            // The recipe is exactly what the user wrote: bare = single-threaded
-            // (free), read_lock = multi-threaded (atomic). No implicit layers.
-            // Dedup happens at the instantiation point (materialize_recipe),
-            // not here — so every recipe path (direct, lock_list, future
-            // auto-inject) converges through the same dedup gate.
             using type = typename materialize_recipe<
                     T, Policy, type_list<Decorators...>>::type;
         };
@@ -92,83 +81,78 @@ namespace access {
         using materialize_t = typename materialize_list<T, Policy, List>::type;
 
 // ============================================================
-// Writer exclusion is compiled in or out with the recipe. Locked: the
-// original CAS protocol. Unlocked: an empty scope, so operator-> is free.
+// write_arrow: resolves the referent for a write expression.
+//
+// In the intrusive refcount model, exclusivity is checked at construction:
+// refcount == 1 means only the rw holder exists. No writer bit, no CAS
+// loop, no scope object — the count IS the lock.
+//
+// Check order (critical for safety):
+//   1. core_valid() — spent-token check via object_storage directly
+//      (NOT through the decorator chain). A spent proxy has object == null.
+//      This MUST happen before any decorator seam or control block access.
+//   2. Exclusivity check via core_control() (root_slot's authoritative
+//      pointer, NOT the decorator chain's observational pointer).
+//      Always compiled — one atomic load, negligible cost.
+//   3. mutable_write_object() — decorator write seam. Only called AFTER
+//      admission succeeds, so decorator side effects (e.g. audit counter)
+//      never fire on a rejected write.
+//
+// The Locked template parameter: bare recipes (Locked=false) have no
+// control block, so the exclusivity check is skipped. Locked recipes
+// (Locked=true) always check refcount == 1.
 // ============================================================
         template <typename T, typename DecoratorList, typename Policy>
         class proxy;
 
-        template <bool Locked>
-        class writer_scope;
-
-        template <>
-        class writer_scope<true> {
-        public:
-            explicit writer_scope(lineage_control* control) noexcept
-                    : control_(control) {
-                if (!control_) {
-                    contract_violation("writer scope requires a live lineage");
-                }
-                access_counter::acquire_writer(control_->state());
-            }
-
-            writer_scope(const writer_scope&) = delete;
-            writer_scope& operator=(const writer_scope&) = delete;
-
-            writer_scope(writer_scope&& rhs) noexcept
-                    : control_(std::exchange(rhs.control_, nullptr)) {}
-
-            writer_scope& operator=(writer_scope&&) = delete;
-
-            ~writer_scope() noexcept {
-                if (control_) {
-                    access_counter::release_writer(control_->state());
-                }
-            }
-
-        private:
-            lineage_control* control_;
-        };
-
-        template <>
-        class writer_scope<false> {
-        public:
-            // Unlocked mode: the referent pointer is intentionally ignored. The
-            // scope is an empty guard that costs nothing and excludes nothing.
-            explicit writer_scope(lineage_control*) noexcept {}
-            writer_scope(const writer_scope&) = delete;
-            writer_scope& operator=(const writer_scope&) = delete;
-            writer_scope(writer_scope&&) noexcept = default;
-            writer_scope& operator=(writer_scope&&) = delete;
-            ~writer_scope() noexcept = default;
-        };
-
         template <typename T, bool Locked>
         class write_arrow {
         public:
-            // Constructed with the owning proxy *after* writer exclusion has
-            // been acquired (member declaration order: scope_ before object_).
-            // The referent pointer is resolved inside the lock, so decorator
-            // write-side state (e.g. audit counters) mutates inside the
-            // protocol's happens-before chain — never before acquire_writer.
-            template <typename DecoratorList>
-            write_arrow(proxy<T, DecoratorList, rw_tag>& proxy_ref) noexcept
-                    : scope_(proxy_ref.control_pointer()), object_(nullptr) {
-                object_ = proxy_ref.mutable_write_object();
-                LSE_UNLIKELY_IF (!object_) {
-                    contract_violation("dereferencing an empty exclusive_access");
+            template <typename DL>
+            write_arrow(proxy<T, DL, rw_tag>& proxy_ref) noexcept
+                    : object_(nullptr) {
+                // Step 1: spent-token check via core seam (object_storage
+                // directly, NOT through decorator chain). Must happen before
+                // touching control block or any decorator seam.
+                if (!proxy_ref.core_valid()) {
+                    contract_violation("using a spent exclusive_access");
                 }
+                // Step 2: exclusivity check — always compiled (one atomic load).
+                // Uses core_control() from root_slot, not the decorator chain.
+                if (Locked) {
+                    auto* ctrl = proxy_ref.core_control();
+                    if (!ctrl || !ctrl->is_exclusive()) {
+                        contract_violation(
+                                "write expression while readers are active");
+                    }
+                }
+                // Step 3: admission passed — NOW invoke the decorator write seam.
+                // Side effects (audit counters, etc.) only fire on admitted writes.
+                object_ = proxy_ref.mutable_write_object();
             }
 
             write_arrow(const write_arrow&) = delete;
             write_arrow& operator=(const write_arrow&) = delete;
-            write_arrow(write_arrow&&) noexcept = default;
+
+            write_arrow(write_arrow&& rhs) noexcept
+                    : object_(std::exchange(rhs.object_, nullptr)) {}
+
             write_arrow& operator=(write_arrow&&) = delete;
 
-            T* operator->() const noexcept { return object_; }
+            T* operator->() const noexcept {
+                LSE_UNLIKELY_IF (!object_) {
+                    contract_violation("dereferencing a moved-from write_arrow");
+                }
+                return object_;
+            }
+            T& operator*() const noexcept {
+                LSE_UNLIKELY_IF (!object_) {
+                    contract_violation("dereferencing a moved-from write_arrow");
+                }
+                return *object_;
+            }
 
         private:
-            writer_scope<Locked> scope_;  // declared first: acquired first
             T* object_;
         };
 
@@ -178,10 +162,8 @@ namespace access {
 // Base order is deliberate:
 //   lineage_root_slot, impl_type
 // Bases are destroyed in reverse order, so the decorator implementation dies
-// before root ownership can delete lineage_control. The reader share is held
-// by the read_lock decorator layer (when the recipe is locked), which is part
-// of impl_type and therefore releases its reader share before the root base
-// is torn down. A bare recipe has no reader counting at all.
+// before root_slot releases its reference. root_slot's dtor calls
+// lineage_control::release(), which self-deletes when refcount reaches 0.
 // ============================================================
         template <typename T, typename DecoratorList, typename Policy>
         class proxy;
@@ -219,11 +201,6 @@ namespace access {
                             std::is_constructible<U, const U&>::value>* = nullptr>
             T clone() const
                 noexcept(std::is_nothrow_constructible<U, const U&>::value) {
-                // No writer exclusion here: this reader itself blocks writers
-                // (reader-preference protocol), so the snapshot it reads is
-                // consistent by construction. Taking a writer scope from a
-                // reader would self-deadlock — the reader count can never
-                // reach zero while this proxy is alive.
                 const T* object = this->const_object();
                 if (!object) {
                     contract_violation("cloning through an empty shared_access");
@@ -234,26 +211,45 @@ namespace access {
 
             explicit operator bool() const noexcept { return this->valid_object(); }
 
+            template <typename F>
+            auto read(F&& f) const
+                noexcept(noexcept(std::declval<F>()(std::declval<const T&>())))
+                -> decltype(std::declval<F>()(std::declval<const T&>())) {
+                const T* object = this->const_object();
+                if (!object) {
+                    contract_violation("reading through an empty shared_access");
+                }
+                return std::forward<F>(f)(*object);
+            }
+
         private:
-            // Root ro: owns the unique control block and also contributes one reader.
-            // A bare root passes a null owner/control: no lineage exists yet.
+            // Root ro: inherits refcount=1 from lineage_control ctor.
             proxy(root_construct_tag,
                   T* object,
-                  lineage_control* control,
-                  std::unique_ptr<lineage_control> owner) noexcept
-                    : lineage_root_slot(std::move(owner)),
+                  lineage_control* control) noexcept
+                    : lineage_root_slot(control),
                       impl_type(object, control) {}
 
-            // Derived ro: keeps only the stable raw pointer; reader count owns lifetime.
+            // Derived ro (borrow_ro): acquires a new reference.
             proxy(lineage_construct_tag, T* object, lineage_control* control) noexcept
-                : lineage_root_slot(), impl_type(object, control) {}
+                    : lineage_root_slot(control), impl_type(object, control) {
+                if (control) control->acquire();
+            }
 
             template <typename, typename, typename>
             friend class proxy;
 
+            template <typename U, bool L>
+            friend class write_arrow;
+
             template <typename... Decorators, typename U>
             friend auto make_ro(U& object)
-            -> proxy<U, type_list<Decorators...>, ro_tag>;
+            -> proxy<U, dedup_t<type_list<Decorators...>>, ro_tag>;
+
+            template <typename T2, typename DL2>
+            friend auto enable_locking(
+                proxy<T2, DL2, rw_tag>&) noexcept
+                -> proxy<T2, dedup_t<typename lock_list<DL2>::type>, rw_tag>;
         };
 
         template <typename T, typename DecoratorList>
@@ -265,18 +261,8 @@ namespace access {
 
             proxy& assign_value(T&& value)
                 noexcept(std::is_nothrow_assignable<T&, T&&>::value) {
-                writer_scope<locked> scope(this->control_pointer());
-
-                // Write expression: resolved inside the lock so decorator
-                // write-side state mutates within the happens-before chain.
-                T* object = this->mutable_write_object();
-                if (!object) {
-                    contract_violation(
-                            "assigning through an empty exclusive_access"
-                    );
-                }
-
-                *object = std::move(value);
+                write_arrow<T, locked> guard(*this);
+                *guard = std::move(value);
                 return *this;
             }
 
@@ -295,18 +281,22 @@ namespace access {
             ~proxy() = default;
 
             write_arrow<T, locked> operator->() noexcept {
-                // The write_arrow constructor acquires writer exclusion first
-                // and resolves the referent inside the lock (see write_arrow).
                 return write_arrow<T, locked>(*this);
             }
 
-            // Direct referent replacement. Value semantics only; no const T& API.
+            template <typename F>
+            auto write(F&& f)
+                noexcept(noexcept(std::declval<F>()(std::declval<T&>())))
+                -> decltype(std::declval<F>()(std::declval<T&>())) {
+                write_arrow<T, locked> guard(*this);
+                return std::forward<F>(f)(*guard);
+            }
+
             template <typename U = T, std::enable_if_t<std::is_assignable<U&, U&&>::value>* = nullptr>
             proxy& assign(T value)
                 noexcept(std::is_nothrow_assignable<U&, U&&>::value) {
                 return assign_value(std::move(value));
             }
-
 
             template <typename U = T, std::enable_if_t<std::is_assignable<U&, U&&>::value>* = nullptr>
             proxy& operator=(T value)
@@ -319,8 +309,6 @@ namespace access {
                                      std::is_constructible<U, const U&>::value>* = nullptr>
             T clone() const
             noexcept(std::is_nothrow_constructible<U, const U&>::value) {
-                writer_scope<locked> scope(this->control_pointer());
-
                 const T* object = this->const_object();
                 if (!object) {
                     contract_violation("cloning through an empty exclusive_access");
@@ -329,51 +317,78 @@ namespace access {
                 return T(*object);
             }
 
-            // Non-destructive read reborrow. rw authority survives but its write
-            // expressions wait until every derived shared_access is destroyed.
+            // Non-destructive read reborrow. rw authority survives; the derived
+            // ro acquires a new reference via core_control() (root_slot's
+            // authoritative pointer, not the decorator chain).
+            //
+            // Reentrancy contract: borrow_ro() must NOT be called from inside
+            // a write expression (operator->, write(lambda), assign). The rw
+            // holder is the only thread that can create the first ro, so no
+            // external thread can violate this — but the rw holder itself can
+            // reenter. Doing so would create a reader during a write, which
+            // the next write_arrow would catch (refcount > 1 → abort). This is
+            // a contract violation, not a runtime-synchronized path.
             ro_type borrow_ro() const noexcept {
                 T* object = this->mutable_object();
                 if (!object) {
                     contract_violation("borrowing from an empty exclusive_access");
                 }
                 return ro_type(
-                        lineage_construct_tag{}, object, this->control_pointer());
+                        lineage_construct_tag{}, object, this->core_control());
             }
 
-            // Destructive downgrade: move root ownership into the returned
-            // shared_access. No && needed — like unique_ptr::release(), the
-            // source handle is invalidated here and any later use of it is a
+            // Destructive downgrade: rw dies, ro is born. The root_slot's
+            // reference is transferred (move, not acquire) — refcount unchanged.
+            // detach_control() transfers the pointer and clears root_slot.
+            // invalidate() then clears object + track_impl's observational
+            // pointer. The source handle is fully spent; any later use is a
             // contract violation, never silent UB.
-            // Bare roots (no lineage yet) transfer the bare referent instead;
-            // the result is a bare shared_access with no control block.
             ro_type downgrade() noexcept {
                 T* object = this->mutable_object();
-                lineage_control* control = this->control_pointer();
                 if (!object) {
                     contract_violation("downgrading an empty exclusive_access");
                 }
 
+                lineage_control* control = this->detach_control();
+
                 if (!control) {
+                    // Bare path: no control block, just transfer the referent.
                     ro_type result(lineage_construct_tag{}, object, nullptr);
                     this->invalidate();
                     return result;
                 }
 
-                auto owner = this->take_root_ownership();
-                ro_type result(
-                        root_construct_tag{}, object, control, std::move(owner));
+                // Locked path: root_slot's reference transferred to ro.
+                // root_construct_tag ctor inherits the refcount (pointer ctor,
+                // no acquire). detach_control() already cleared root_slot.
+                ro_type result(root_construct_tag{}, object, control);
                 this->invalidate();
                 return result;
             }
 
             explicit operator bool() const noexcept { return this->valid_object(); }
 
+            // Core validity — bypasses all decorators, checks object_storage
+            // directly. Used by write_arrow for spent-token check before any
+            // decorator seam or control block access.
+            bool core_valid() const noexcept {
+                return this->object_storage<T>::valid_object();
+            }
+
+            // Core token-state operation: clear the proxy completely.
+            // Bypasses user decorators (which sit above track in the chain)
+            // but goes through track_impl to clear its observational control_
+            // pointer. This ensures a spent token has:
+            //   object == null, core control == null, observational control == null
+            void invalidate() noexcept {
+                this->track_impl<object_storage<T>, rw_tag>::invalidate();
+            }
+
         private:
             proxy(root_construct_tag,
                   T* object,
-                  lineage_control* control,
-                  std::unique_ptr<lineage_control> owner) noexcept
-                    : lineage_root_slot(std::move(owner)),
+                  lineage_control* control) noexcept
+                    : lineage_root_slot(control),
                       impl_type(object, control) {}
 
             template <typename, typename, typename>
@@ -382,141 +397,96 @@ namespace access {
             template <typename U, bool L>
             friend class write_arrow;
 
-            // Grant enable_locking access to private constructors across
-            // all proxy instantiations (source bare + target locked).
-            template <typename T2, typename... Ds2>
+            template <typename T2, typename DL2>
             friend auto enable_locking(
-                proxy<T2, type_list<Ds2...>, rw_tag>&) noexcept
-                -> proxy<T2, typename lock_list<type_list<Ds2...>>::type, rw_tag>;
+                proxy<T2, DL2, rw_tag>&) noexcept
+                -> proxy<T2, dedup_t<typename lock_list<DL2>::type>, rw_tag>;
 
             template <typename... Decorators, typename U>
             friend auto make_rw(U& object)
-            -> proxy<U, type_list<Decorators...>, rw_tag>;
+            -> proxy<U, dedup_t<type_list<Decorators...>>, rw_tag>;
         };
 
-// User-facing aliases are mostly useful for contracts/tests; factory return
-// types are intentionally best consumed with auto.
+// User-facing aliases.
         template <typename T, typename... Decorators>
-        using shared_access = proxy<T, type_list<Decorators...>, ro_tag>;
+        using shared_access = proxy<T, dedup_t<type_list<Decorators...>>, ro_tag>;
 
         template <typename T, typename... Decorators>
-        using exclusive_access = proxy<T, type_list<Decorators...>, rw_tag>;
+        using exclusive_access = proxy<T, dedup_t<type_list<Decorators...>>, rw_tag>;
 
 // ============================================================
-// Factories: users only list the extra dolls they want to wrap.
-// Facade, track, and object_storage are implicit.
-// Exactly one root proxy starts with unique_ptr ownership.
+// Factories.
 // ============================================================
         template <typename... Decorators, typename T>
         auto make_ro(T& object)
-        -> proxy<T, type_list<Decorators...>, ro_tag> {
+            -> proxy<T, dedup_t<type_list<Decorators...>>, ro_tag> {
             static_assert(!std::is_array<T>::value && !std::is_function<T>::value,
                           "make_ro requires an object type, not an array or function");
+            using D = dedup_t<type_list<Decorators...>>;
 
-            // A bare root (no read_lock) defers the shared era entirely: no
-            // heap control block, no atomics, no registry entry. The lineage is
-            // created lazily if/when an exclusive root is passed to
-            // enable_locking() to enter the locked (shared) era.
-            constexpr bool free =
-                    !contains<read_lock, type_list<Decorators...>>::value;
+            constexpr bool free = !contains<read_lock, D>::value;
             if (free) {
-                return proxy<T, type_list<Decorators...>, ro_tag>(
+                return proxy<T, D, ro_tag>(
                         root_construct_tag{},
                         std::addressof(object),
-                        nullptr,
                         nullptr);
             }
 
-            auto owner = std::make_unique<lineage_control>(std::addressof(object));
-            lineage_control* control = owner.get();
+            auto* control = new lineage_control(std::addressof(object));
 
-            return proxy<T, type_list<Decorators...>, ro_tag>(
+            return proxy<T, D, ro_tag>(
                     root_construct_tag{},
                     std::addressof(object),
-                    control,
-                    std::move(owner));
+                    control);
         }
 
         template <typename... Decorators, typename T>
         auto make_rw(T& object)
-        -> proxy<T, type_list<Decorators...>, rw_tag> {
+            -> proxy<T, dedup_t<type_list<Decorators...>>, rw_tag> {
             static_assert(!std::is_const<T>::value,
                           "cannot create exclusive_access for a const object");
             static_assert(!std::is_array<T>::value && !std::is_function<T>::value,
                           "make_rw requires an object type, not an array or function");
+            using D = dedup_t<type_list<Decorators...>>;
 
-            // Same lazy-lineage rule as make_ro: bare roots are free.
-            constexpr bool free =
-                    !contains<read_lock, type_list<Decorators...>>::value;
+            constexpr bool free = !contains<read_lock, D>::value;
             if (free) {
-                return proxy<T, type_list<Decorators...>, rw_tag>(
+                return proxy<T, D, rw_tag>(
                         root_construct_tag{},
                         std::addressof(object),
-                        nullptr,
                         nullptr);
             }
 
-            auto owner = std::make_unique<lineage_control>(std::addressof(object));
-            lineage_control* control = owner.get();
+            auto* control = new lineage_control(std::addressof(object));
 
-            return proxy<T, type_list<Decorators...>, rw_tag>(
+            return proxy<T, D, rw_tag>(
                     root_construct_tag{},
                     std::addressof(object),
-                    control,
-                    std::move(owner));
+                    control);
         }
 
 // ============================================================
 // enable_locking: bare exclusive_access -> locked exclusive_access.
 //
-// Destructive: the source proxy hands its root ownership to the returned
-// locked proxy and is invalidated. No && needed — like unique_ptr::release(),
-// the source handle is dead after the call and any later use trips a
-// contract violation.
-//
-// Why static_assert, not SFINAE: this free function needs a friend declaration
-// to reach the private root-construct constructor. Empirically (tested, g++):
-//   - enable_if as a defaulted template param on the function  -> AMBIGUOUS:
-//     the friend decl (no defaulted param) and the definition become two
-//     distinct templates, both candidates;
-//   - mirroring the enable_if onto the friend decl              -> ILLEGAL:
-//     "default template arguments may not be used in template friend
-//     declarations" (hard language rule);
-//   - enable_if in the trailing return type                     -> AMBIGUOUS:
-//     same split — friend names proxy<...> return, defn names enable_if_t<...>.
-// SFINAE alters the function template's signature; friend matching requires
-// identical signatures; the two are in direct conflict for one function. The
-// member lock() could SFINAE (members befriend themselves), but a .lock()
-// method on a *bare* (lock-free) proxy is misleading, so this is a free
-// function + static_assert instead. The static_assert also gives a clearer
-// message than "no matching function" would.
-//
-// This is the lazy-lineage seam: the shared era (heap control block,
-// atomics, registry entry) begins exactly here. lineage_control's constructor
-// registers with the root_registry, so a second bare root locking the same
-// referent aborts in Debug. Release builds skip that check by contract.
-//
-// Orphan-reader contract: any shared_access derived from the source proxy
-// before enable_locking (via borrow_ro) must be destroyed first.
+// Destructive: the source proxy is invalidated. The locked proxy gets a
+// fresh control block (refcount=1).
 // ============================================================
-        template <typename T, typename... Decorators>
+        template <typename T, typename DecoratorList>
         auto enable_locking(
-            proxy<T, type_list<Decorators...>, rw_tag>& rw) noexcept
-            -> proxy<T, typename lock_list<type_list<Decorators...>>::type, rw_tag> {
-            static_assert(!contains<read_lock, type_list<Decorators...>>::value,
+            proxy<T, DecoratorList, rw_tag>& rw) noexcept
+            -> proxy<T, dedup_t<typename lock_list<DecoratorList>::type>, rw_tag> {
+            static_assert(!contains<read_lock, DecoratorList>::value,
                           "enable_locking requires a bare (unlocked) exclusive_access");
             using locked_proxy =
-                proxy<T, typename lock_list<type_list<Decorators...>>::type, rw_tag>;
+                proxy<T, dedup_t<typename lock_list<DecoratorList>::type>, rw_tag>;
 
             T* object = rw.mutable_object();
             if (!object) {
                 contract_violation("locking an empty exclusive_access");
             }
 
-            auto owner = std::make_unique<lineage_control>(object);
-            lineage_control* control = owner.get();
-            locked_proxy result(
-                    root_construct_tag{}, object, control, std::move(owner));
+            auto* control = new lineage_control(object);
+            locked_proxy result(root_construct_tag{}, object, control);
             rw.invalidate();
             return result;
         }

@@ -6,11 +6,9 @@
 // This layer owns everything that must exist for a proxy to have a referent
 // and a lifetime:
 //   - contract_violation       : the single abort-on-contract-breach sink
-//   - access_state / counter   : the atomic reader/writer/root admission word
+//   - lineage_control          : intrusive ref-counted control block
 //   - root_registry            : Debug-only single-lineage provenance checker
-//   - lineage_control          : heap control block (created eagerly by locked
-//                                roots, lazily by lock())
-//   - lineage_root_slot        : unique_ptr root ownership base
+//   - lineage_root_slot        : RAII reference holder (acquire on copy, release on dtor)
 //   - object_storage           : the terminal storage layer of every recipe
 //   - track_impl / track       : mandatory layer anchoring the lineage control
 //
@@ -19,15 +17,12 @@
 #ifndef LEASE_STORAGE_HPP
 #define LEASE_STORAGE_HPP
 
-#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <memory>
 #include <mutex>
-#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -44,173 +39,6 @@ namespace access {
             std::fprintf(stderr, "lease::access contract violation: %s\n", message);
             std::abort();
         }
-
-// ============================================================
-// Mandatory lineage-local reader-preferred read/write admission +
-// intrusive lineage lifetime.
-//
-// word layout:
-//   bit0      : writer operation active
-//   bit1      : root proxy still owns the control block
-//   bits2..63 : live shared_access count * 4
-//
-// The root proxy starts with unique_ptr ownership. If it dies while readers
-// remain, it clears root_alive and releases the unique_ptr. The last reader
-// observes root_alive == false and deletes the control block: the familiar
-// "last closer turns off the lights" protocol.
-// ============================================================
-        struct access_state {
-            static constexpr std::uint64_t writer_bit = 1;
-            static constexpr std::uint64_t root_bit = 2;
-            static constexpr std::uint64_t reader_unit = 4;
-
-            std::atomic<std::uint64_t> word{root_bit};
-        };
-
-// ============================================================
-// Adaptive spin backoff, adapted from flux_foundry/utility/back_off.h
-// (backoff_strategy), so this TU keeps the same contention behavior
-// as the parent library.
-//
-// Two-phase strategy: the first `spin_limit` calls busy-wait with
-// exponentially increasing pause bursts (count 1,2,4,... capped at
-// max_loop), then fall back to std::this_thread::yield(). pause is a
-// few dozen cycles and cache-friendly; yield is ~1us and reschedules.
-// ============================================================
-        template <size_t spin_limit = 16, size_t max_loop = 1024>
-        struct backoff_strategy {
-            size_t count {1};
-            size_t steps {0};
-
-            void reset() noexcept {
-                count = 1;
-                steps = 0;
-            }
-
-            void yield() noexcept {
-                if (steps < spin_limit) {
-                    for (size_t i = 0; i < count; ++i) {
-#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
-                        _mm_pause();
-#elif defined(__aarch64__)
-                        __asm__ __volatile__("yield");
-#elif defined(_M_ARM64)
-                        __yield();
-#else
-                        std::atomic_signal_fence(std::memory_order_relaxed);
-#endif
-                    }
-                    count = std::min(count << 1, max_loop);
-                    ++steps;
-                } else {
-                    std::this_thread::yield();
-                }
-            }
-        };
-
-        namespace access_counter {
-
-            constexpr std::uint64_t writer_bit = access_state::writer_bit;
-            constexpr std::uint64_t root_bit = access_state::root_bit;
-            constexpr std::uint64_t reader_unit = access_state::reader_unit;
-            constexpr std::uint64_t reader_mask = ~(writer_bit | root_bit);
-            constexpr std::uint64_t max_readers = (UINT64_MAX >> 2);
-
-            inline std::uint64_t reader_count(std::uint64_t word) noexcept {
-                return (word & reader_mask) >> 2;
-            }
-
-            LSE_FORCE_INLINE void acquire_reader(access_state& state) noexcept {
-                std::uint64_t current = state.word.load(std::memory_order_relaxed);
-                backoff_strategy<> backoff;
-
-                for (;;) {
-                    if ((current & writer_bit) != 0) {
-                        current = state.word.load(std::memory_order_acquire);
-                        backoff.yield();
-                        continue;
-                    }
-
-                    if (reader_count(current) == max_readers) {
-                        contract_violation("reader count overflow");
-                    }
-
-                    if (state.word.compare_exchange_weak(
-                            current,
-                            current + reader_unit,
-                            std::memory_order_acquire,
-                            std::memory_order_relaxed)) {
-                        return;
-                    }
-                }
-            }
-
-// Returns true when this reader is the last live participant after the root
-// has already gone. The caller then owns final deletion of lineage_control.
-            LSE_FORCE_INLINE bool release_reader(access_state& state) noexcept {
-                const std::uint64_t previous =
-                        state.word.fetch_sub(reader_unit, std::memory_order_acq_rel);
-
-                if (reader_count(previous) == 0 || (previous & writer_bit) != 0) {
-                    contract_violation("bad reader lifecycle");
-                }
-
-                return reader_count(previous) == 1 && (previous & root_bit) == 0;
-            }
-
-            LSE_FORCE_INLINE void acquire_writer(access_state& state) noexcept {
-                std::uint64_t expected = root_bit;
-                backoff_strategy<> backoff;
-
-                for (;;) {
-                    if (state.word.compare_exchange_weak(
-                            expected,
-                            root_bit | writer_bit,
-                            std::memory_order_acquire,
-                            std::memory_order_relaxed)) {
-                        return;
-                    }
-
-                    if ((expected & root_bit) == 0) {
-                        contract_violation("writer used after root ownership was released");
-                    }
-
-                    // Reader preference: new readers may still enter while this writer waits.
-                    expected = root_bit;
-                    backoff.yield();
-                }
-            }
-
-            LSE_FORCE_INLINE void release_writer(access_state& state) noexcept {
-                std::uint64_t expected = root_bit | writer_bit;
-
-                if (!state.word.compare_exchange_strong(
-                        expected,
-                        root_bit,
-                        std::memory_order_release,
-                        std::memory_order_relaxed)) {
-                    contract_violation("bad writer lifecycle");
-                }
-            }
-
-// Releases root ownership. Returns true if no readers remain and the root's
-// unique_ptr should delete the control block immediately. Otherwise the root
-// releases its unique_ptr and the last reader will delete the orphan.
-            LSE_FORCE_INLINE bool release_root(access_state& state) noexcept {
-                const std::uint64_t previous =
-                        state.word.fetch_and(~root_bit, std::memory_order_acq_rel);
-
-                if ((previous & root_bit) == 0) {
-                    contract_violation("root ownership released twice");
-                }
-                if ((previous & writer_bit) != 0) {
-                    contract_violation("root destroyed during an active write expression");
-                }
-
-                return reader_count(previous) == 0;
-            }
-
-        } // namespace access_counter
 
 // ============================================================
 // Debug-only root provenance checker.
@@ -261,82 +89,130 @@ namespace access {
 #endif
         };
 
-// Shared by every proxy in one legal lineage. Ownership begins in exactly
-// one root proxy. Derived readers keep only a stable raw pointer.
-        class lineage_control {
+// ============================================================
+// lineage_control — intrusive ref-counted control block.
+//
+// The control block is born with refcount = 1 (the creator's reference).
+// Every proxy that holds a reference calls acquire() (+1) on copy and
+// release() (-1) on destruction. When refcount reaches 0, the control
+// block deletes itself and cleans up the Debug provenance entry.
+//
+// Write authority: refcount == 1 means only one participant exists —
+// exclusive by construction. refcount > 1 means readers are active →
+// contract violation (always checked — one atomic load, negligible cost).
+//
+// No writer bit, no root bit, no CAS loop, no backoff. The count IS the lock.
+// ============================================================
+        class lineage_control final : public pooling_base<lineage_control> {
         public:
             explicit lineage_control(const void* object) noexcept
                     : object_(object) {
                 root_registry::acquire(object_, this);
             }
 
-            ~lineage_control() noexcept {
-                if (state_.word.load(std::memory_order_relaxed) != 0) {
-                    contract_violation("lineage destroyed with live participants");
-                }
-                root_registry::release(object_, this);
-            }
-
             lineage_control(const lineage_control&) = delete;
             lineage_control& operator=(const lineage_control&) = delete;
 
-            access_state& state() noexcept { return state_; }
+            // Add a reference (e.g. ro copy, borrow_ro).
+            void acquire() noexcept {
+                refcount_.fetch_add(1, std::memory_order_acq_rel);
+            }
+
+            // Remove a reference. When refcount reaches 0, clean up Debug
+            // provenance and self-delete.
+            void release() noexcept {
+                if (refcount_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    root_registry::release(object_, this);
+                    delete this;
+                }
+            }
+
+            // Debug-only exclusive-write check: only one participant.
+            bool is_exclusive() const noexcept {
+                return refcount_.load(std::memory_order_acquire) == 1;
+            }
+
+            // Observational (for audit/debug decorators).
+            std::uint64_t refcount_value() const noexcept {
+                return refcount_.load(std::memory_order_relaxed);
+            }
+
             const void* object_id() const noexcept { return object_; }
 
         private:
+            ~lineage_control() noexcept = default;
+
             const void* object_;
-            access_state state_;
+            std::atomic<std::uint64_t> refcount_{1};
         };
 
-// Root ownership is unique, address-stable, and deliberately not copied.
-// It is a base declared before the implementation base so its destructor runs
-// after the decorator chain has already been destroyed.
+// ============================================================
+// lineage_root_slot — RAII reference holder.
+//
+// Every proxy (rw or ro) inherits this base. It holds a raw pointer to
+// lineage_control and manages one reference:
+//   - Default ctor: control_ = nullptr (bare proxy, no control block).
+//   - Pointer ctor: inherits the initial refcount=1 from lineage_control's
+//     ctor. Does NOT acquire — the creator's reference is already counted.
+//   - Copy ctor: acquires a new reference (+1). This is how derived ro
+//     proxies (borrow_ro, ro copy) get their own reference.
+//   - Move ctor: transfers the pointer, source becomes nullptr. No acquire.
+//     This is how downgrade works — rw's reference becomes ro's, refcount
+//     unchanged.
+//   - Destructor: releases the reference (-1). If refcount reaches 0,
+//     lineage_control self-deletes.
+//
+// The slot is declared before the impl_type base so its destructor runs
+// AFTER the decorator chain has been destroyed (reverse base order).
+// ============================================================
         class lineage_root_slot {
         protected:
-            lineage_root_slot() noexcept = default;
+            lineage_root_slot() noexcept : control_(nullptr) {}
 
-            // A root may carry no ownership: bare (single-thread) roots
-            // defer lineage creation until lock() and hold a bare referent
-            // instead. Locked roots always pass a non-null owner (the factories
-            // guarantee it), so the non-null check lives there.
-            explicit lineage_root_slot(
-                    std::unique_ptr<lineage_control> owner) noexcept
-                    : owner_(std::move(owner)) {}
+            // Root construction: inherits the refcount=1 from lineage_control.
+            explicit lineage_root_slot(lineage_control* control) noexcept
+                    : control_(control) {}
 
-            // Copying a shared_access creates a derived reader, not a second root owner.
-            lineage_root_slot(const lineage_root_slot&) noexcept {}
+            // Copy: acquire a new reference (derived ro / ro copy).
+            lineage_root_slot(const lineage_root_slot& rhs) noexcept
+                    : control_(rhs.control_) {
+                if (control_) control_->acquire();
+            }
 
-            lineage_root_slot(lineage_root_slot&&) noexcept = default;
+            // Move: transfer the reference, source is emptied.
+            lineage_root_slot(lineage_root_slot&& rhs) noexcept
+                    : control_(rhs.control_) {
+                rhs.control_ = nullptr;
+            }
 
             lineage_root_slot& operator=(const lineage_root_slot&) = delete;
             lineage_root_slot& operator=(lineage_root_slot&&) = delete;
 
             ~lineage_root_slot() noexcept {
-                release_root_ownership();
+                if (control_) control_->release();
             }
 
-            std::unique_ptr<lineage_control> take_root_ownership() noexcept {
-                if (!owner_) {
-                    contract_violation("proxy does not own the lineage root");
-                }
-                return std::move(owner_);
+            // ---- Core authority accessors ----
+            // These are the ONLY methods core operations (write_arrow,
+            // borrow_ro, downgrade) use to reach the control block.
+            // The decorator chain's control_pointer() is observational only
+            // and must never be used for authority decisions.
+
+            // Authoritative read-only access to the control block.
+            lineage_control* core_control() const noexcept {
+                return control_;
+            }
+
+            // Transfer ownership: returns the pointer and clears the slot.
+            // The caller becomes responsible for the reference.
+            lineage_control* detach_control() noexcept {
+                auto* c = control_;
+                control_ = nullptr;
+                return c;
             }
 
         private:
-            void release_root_ownership() noexcept {
-                if (!owner_) {
-                    return;
-                }
-
-                if (access_counter::release_root(owner_->state())) {
-                    owner_.reset();
-                } else {
-                    // Readers keep the raw stable pointer. The final reader deletes it.
-                    (void)owner_.release();
-                }
-            }
-
-            std::unique_ptr<lineage_control> owner_;
+            lineage_control* control_;
         };
 
 // ============================================================
@@ -378,7 +254,8 @@ namespace access {
 
 // ============================================================
 // Mandatory default track decorator.
-// It anchors the shared lineage control; debug provenance lives in that control.
+// It anchors the shared lineage control pointer; debug provenance lives
+// in lineage_control.
 //
 // track is a decorator by shape (it has an apply seam) but it is mandatory and
 // may never be listed in a user recipe; it always sits directly above
@@ -393,9 +270,6 @@ namespace access {
 
             track_impl(value_type* object, lineage_control* control) noexcept
                     : Inner(object, control), control_(control) {
-                // control_ may be null for bare (single-thread) lineages
-                // whose shared control has not been created yet. control() is
-                // therefore locked-only; control_pointer() is the null-safe view.
             }
 
             track_impl(const track_impl&) noexcept = default;
@@ -417,12 +291,6 @@ namespace access {
 
             lineage_control* control_pointer() const noexcept { return control_; }
 
-            // Write-expression seam (optional). Write expressions (operator->
-            // through write_arrow) call this *after* writer exclusion has been
-            // acquired, so decorators that override it observe/update state
-            // inside the protocol's happens-before chain. Management operations
-            // (borrow_ro / downgrade / lock) use mutable_object directly and
-            // are not write expressions.
             value_type* mutable_write_object() const noexcept {
                 return this->mutable_object();
             }

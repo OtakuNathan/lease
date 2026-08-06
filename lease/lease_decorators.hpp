@@ -23,8 +23,8 @@
 // change behavior by overriding the protected referent seam
 // (mutable_object / const_object / invalidate).
 // The optional write-expression seam (mutable_write_object) is called by
-// write expressions *after* writer exclusion has been acquired — override it
-// to observe/update state inside the protocol's happens-before chain.
+// write expressions to resolve the referent — override it to observe/update
+// state for each write expression.
 //
 // Every decorator MUST satisfy the contract checked by decorator_probe at the
 // bottom of this file:
@@ -55,8 +55,8 @@ namespace access {
 // read_lock is the explicit opt-in for the multi-threaded mode. Explicit
 // beats implicit: a bare recipe (no read_lock) is single-threaded and free —
 // no atomics, no heap control block, no registry entry. Listing read_lock
-// arms the shared era: reader counting is atomic and writer expressions use
-// CAS exclusion.
+// arms the shared era: participant counting is atomic and write expressions
+// check exclusivity (count == 1) in Debug.
 //
 // Lock rule (compile-time enforced):
 //   an exclusive_access without read_lock may be passed to enable_locking()
@@ -67,51 +67,26 @@ namespace access {
         template <typename Inner, typename Policy>
         class read_lock_impl;
 
-// Locked read-share decorator. Each derived copy contributes one reader;
-// the last live participant after the root has gone deletes the orphaned
-// control block (the read_lease contract, moved into the decorator chain).
+// Locked read-share decorator. Pure recipe marker — does NOT participate
+// in refcounting. The lineage_root_slot base handles acquire/release.
+// read_lock's presence in the recipe drives the locked path (control block
+// exists, write_arrow checks exclusivity in Debug).
         template <typename Inner>
         class read_lock_impl<Inner, ro_tag> : public Inner {
         public:
             using value_type = typename Inner::value_type;
             using policy_type = ro_tag;
+            using Inner::Inner;
 
-            read_lock_impl(value_type* object, lineage_control* control) noexcept
-                    : Inner(object, control), control_(control) {
-                if (control_) {
-                    access_counter::acquire_reader(control_->state());
-                }
-            }
-
-            read_lock_impl(const read_lock_impl& rhs) noexcept
-                    : Inner(rhs), control_(rhs.control_) {
-                if (control_) {
-                    access_counter::acquire_reader(control_->state());
-                }
-            }
-
-            read_lock_impl(read_lock_impl&& rhs) noexcept
-                    : Inner(std::move(rhs)),
-                      control_(std::exchange(rhs.control_, nullptr)) {}
-
+            read_lock_impl(const read_lock_impl&) noexcept = default;
+            read_lock_impl(read_lock_impl&&) noexcept = default;
             read_lock_impl& operator=(const read_lock_impl&) = delete;
             read_lock_impl& operator=(read_lock_impl&&) = delete;
-
-            ~read_lock_impl() noexcept {
-                if (control_ && access_counter::release_reader(control_->state())) {
-                    delete control_;
-                }
-            }
-
-        protected:
-            lineage_control* control_pointer() const noexcept { return control_; }
-
-        private:
-            lineage_control* control_;
         };
 
-// rw-side read_lock is a pure recipe marker: an exclusive proxy never counts
-// readers itself. Its presence in the recipe drives the locked writer path.
+// rw-side read_lock is a pure recipe marker: an exclusive proxy's write
+// expressions check refcount for exclusivity. Its presence in the
+// recipe drives the locked path (control block exists).
         template <typename Inner>
         class read_lock_impl<Inner, rw_tag> : public Inner {
         public:
@@ -145,18 +120,22 @@ namespace access {
 // Shallow: forwards to T's own indexing, returning T's own reference
 // type. Does not wrap elements in capabilities.
 //
-// ro_tag only: reader-preference protocol blocks writers, so const
-// element access is safe without additional synchronization. For
-// rw_tag, use rw->operator[](key) through write_arrow, which handles
-// writer exclusion correctly.
+// ro_tag only: participant count ensures no writer is active, so const
+// element access is safe. For rw_tag, use rw->operator[](key) through
+// write_arrow, which checks exclusivity in Debug.
 // ============================================================
         namespace detail {
 
-            // Priority 1: T has key_type (map-like containers).
+            // Priority 1: T has key_type AND at(key_type) (map-like containers).
+            // Requiring at() avoids false positives on set-like containers that
+            // have key_type but no at() (e.g. std::set).
             template <typename T, typename = void>
             struct map_key { static constexpr bool value = false; };
             template <typename T>
-            struct map_key<T, void_t<typename T::key_type>> {
+            struct map_key<T, void_t<
+                typename T::key_type,
+                decltype(std::declval<const T&>().at(std::declval<typename T::key_type>()))
+            >> {
                 static constexpr bool value = true;
                 using type = typename T::key_type;
             };

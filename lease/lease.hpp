@@ -209,6 +209,8 @@ namespace lease {
 
 } // namespace lease
 
+// Layer 0: pooled allocation for lineage_control (borrowed from flux_foundry).
+#include "lease_pool.hpp"
 // Layer 1: raw storage, lineage control, mandatory track layer.
 #include "lease_storage.hpp"
 // Layer 2: optional decorators + decorator contract probe (extension point).

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -35,13 +36,11 @@ namespace demo {
 // ---- Demo decorator: audit -------------------------------------------------
 // Not part of the library: it is the worked example for the decorator
 // extension point. Two observations:
-//   * access_count() counts only write expressions, incremented inside the
-//     writer exclusion (write_arrow -> mutable_write_object), so a plain
-//     counter is race-free under the read_lock protocol's happens-before
-//     edges; bare recipes are single-threaded by contract.
-//   * active_readers()/writer_active()/root_alive() merely observe the
-//     read_lock atomic word. They are not used for synchronization, so
-//     memory_order_relaxed is enough — acquire would only add cost.
+//   * access_count() counts only write expressions, incremented inside
+//     mutable_write_object (called by write_arrow).
+//   * participant_count()/active_readers() merely observe the participant
+//     count. They are not used for synchronization, so memory_order_relaxed
+//     is enough — acquire would only add cost.
     template <typename Inner, typename Policy>
     class audit_impl : public Inner {
     public:
@@ -51,28 +50,19 @@ namespace demo {
 
         std::size_t access_count() const noexcept { return accesses_; }
 
-        std::size_t active_readers() const noexcept {
+        std::uint64_t participant_count() const noexcept {
             if (auto* control = this->control_pointer()) {
-                return lease::access::access_counter::reader_count(
-                        control->state().word.load(std::memory_order_relaxed));
+                return control->refcount_value();
             }
             return 0;
         }
 
-        bool writer_active() const noexcept {
+        std::uint64_t active_readers() const noexcept {
             if (auto* control = this->control_pointer()) {
-                return (control->state().word.load(std::memory_order_relaxed) &
-                        lease::access::access_counter::writer_bit) != 0;
+                std::uint64_t v = control->refcount_value();
+                return v > 1 ? v - 1 : 0;
             }
-            return false;
-        }
-
-        bool root_alive() const noexcept {
-            if (auto* control = this->control_pointer()) {
-                return (control->state().word.load(std::memory_order_relaxed) &
-                        lease::access::access_counter::root_bit) != 0;
-            }
-            return false;
+            return 0;
         }
 
     protected:
@@ -185,11 +175,11 @@ namespace demo {
     static_assert(std::is_same<
                           decltype(std::declval<exclusive_access<widget>&>().operator->()),
                           lease::access::write_arrow<widget, false>>::value,
-                  "bare rw uses an empty writer scope");
+                  "bare rw write_arrow has no exclusivity check");
     static_assert(std::is_same<
                           decltype(std::declval<locked_rw&>().operator->()),
                           lease::access::write_arrow<widget, true>>::value,
-                  "read_lock rw uses atomic writer exclusion");
+                  "locked rw write_arrow checks count == 1 in Debug");
 
     // A bare rw locks into a read_lock rw; the target recipe carries read_lock.
     // enable_locking is callable on an lvalue (no &&): like unique_ptr::release(),
@@ -200,9 +190,8 @@ namespace demo {
                           locked_rw>::value,
                   "bare rw locks into read_lock rw");
 
-    // A locked rw can never downgrade: no reverse conversion is declared, and
-    // lock() is SFINAE'd to bare recipes only, so a locked proxy has no lock()
-    // member at all — the restriction is structural, not a static_assert.
+    // A locked rw can never re-lock: enable_locking() carries a static_assert
+    // that rejects already-locked proxies, and no reverse conversion exists.
 
     void free_mode_test() {
         widget w;
@@ -213,22 +202,22 @@ namespace demo {
             auto rw = make_rw(w);
             rw->set(1);
 
-            auto ro = rw.borrow_ro();       // bare ro: no reader count
-            auto ro2 = ro;                  // free copy
-            assert(ro->get() == 1);
-            assert(ro2->get() == 1);
+            {
+                auto ro = rw.borrow_ro();       // bare ro: no reader count
+                auto ro2 = ro;                  // free copy
+                assert(ro->get() == 1);
+                assert(ro2->get() == 1);
 
-            rw->set(2);                     // bare write: no CAS, no wait
-            assert(ro->get() == 2);         // same referent, readers see it
+                rw->set(2);                     // bare write: no count check
+                assert(ro->get() == 2);         // same referent, readers see it
+            } // ro/ro2 destroyed — orphan-reader contract satisfied before enable_locking
 
             // Lock: bare rw -> read_lock rw. Destructive; the old handle hands
             // over root ownership and is invalidated. No std::move needed.
-            // (The derived ro above is out of scope here — the orphan-reader
-            // contract requires it destroyed before enable_locking.)
             auto locked = enable_locking(rw);
             assert(!rw);
 
-            locked->set(3);                 // locked write: CAS enforced now
+            locked->set(3);                 // locked write: count checked in Debug
             auto locked_ro = locked.borrow_ro();   // locked ro: counts readers
             auto locked_ro2 = locked_ro;           // counted copy
             assert(locked_ro->get() == 3);
@@ -277,16 +266,15 @@ namespace demo {
         assert(rw.access_count() >= 1);
 
         {
-            auto ro1 = rw.borrow_ro();     // reader acquired via protocol
-            auto ro2 = ro1;                // +1 reader each
-            assert(rw.active_readers() >= 2);  // observed via protocol state
-            assert(rw.root_alive());
-            assert(!rw.writer_active());   // no write expression in flight
+            auto ro1 = rw.borrow_ro();     // participant added
+            auto ro2 = ro1;                // +1 participant each
+            assert(rw.active_readers() >= 2);  // observed via participant count
+            assert(rw.participant_count() >= 3); // rw + ro1 + ro2
             assert(ro1->get() == 7);
             assert(ro2->get() == 7);
 
-            // rw->set(...) here would wait for ro1/ro2 and self-deadlock in this
-            // thread. That is the deliberate reader-preferred runtime contract.
+            // rw->set(...) here would abort in Debug: participants > 1.
+            // That is the contract — write with no readers, or read with no write.
         }
 
         rw.assign(widget{11});             // 2nd write expression (counted)
@@ -296,15 +284,15 @@ namespace demo {
         auto ro = rw.downgrade();          // management op: not counted
         assert(!rw);
         assert(ro->get() == 11);
-        // The downgraded root itself holds one reader share.
-        assert(ro.active_readers() == 1);
+        // After downgrade: rw's reference transferred to ro. refcount = 1.
+        assert(ro.participant_count() == 1);
 
         std::puts("object_test OK");
     }
 
-    // Regression test for the shared_access::clone() self-deadlock: a reader
-    // holds the reader count, so taking a writer scope from it could never
-    // succeed. clone() must not attempt writer exclusion at all.
+    // Regression test: clone() on a shared_access must not attempt any
+    // exclusivity check — the reader is a participant, and the data it
+    // reads is consistent because rw cannot write while this ro lives.
     void ro_clone_test() {
         widget w;
 
@@ -400,35 +388,41 @@ namespace demo {
     void concurrency_test() {
         widget w;
         // Multi-threading is explicit: only a read_lock recipe may cross
-        // threads. A bare recipe here would be a silent data race — the whole
-        // point of "explicit beats implicit".
+        // threads. The participant count model: ro copies may be shared across
+        // threads freely; writing requires count == 1 (no active readers).
         auto rw = make_rw<read_lock>(w);
+        rw->set(42);
 
         constexpr int iterations = 20000;
         std::atomic<std::int64_t> checksum{0};
 
-        std::thread writer([&] {
-            for (int i = 0; i < iterations; ++i) {
-                rw->set(i);
+        // Phase 1: borrow ro copies and let reader threads read concurrently.
+        // This tests that participant_count::add()/remove() are thread-safe.
+        {
+            auto ro = rw.borrow_ro();  // count = 2 (rw + ro)
+
+            std::vector<std::thread> readers;
+            for (int t = 0; t < 3; ++t) {
+                readers.emplace_back([&] {
+                    for (int i = 0; i < iterations; ++i) {
+                        // Each copy adds/removes a participant atomically.
+                        auto local_ro = ro;  // copy: count += 1
+                        checksum.fetch_add(local_ro->get(), std::memory_order_relaxed);
+                        // local_ro destroyed: count -= 1
+                    }
+                });
             }
-        });
 
-        std::vector<std::thread> readers;
-        for (int t = 0; t < 3; ++t) {
-            readers.emplace_back([&] {
-                for (int i = 0; i < iterations; ++i) {
-                    auto ro = rw.borrow_ro();
-                    checksum.fetch_add(ro->get(), std::memory_order_relaxed);
-                }
-            });
-        }
+            for (auto& thread : readers) {
+                thread.join();
+            }
+        } // ro destroyed: count back to 1 (only rw)
 
-        writer.join();
-        for (auto& thread : readers) {
-            thread.join();
-        }
+        // Phase 2: all readers gone, rw can write again (count == 1).
+        rw->set(99);
+        assert(w.value == 99);
 
-        assert(checksum.load(std::memory_order_relaxed) >= 0);
+        assert(checksum.load(std::memory_order_relaxed) > 0);
         std::puts("concurrency_test OK");
     }
 
@@ -445,6 +439,20 @@ namespace demo {
                   "vector is indexable");
     static_assert(lease::access::detail::is_indexable<std::map<std::string, int>>::value,
                   "map is indexable");
+
+    // Fix #1: std::set has key_type but no at() — must NOT be detected as map-like.
+    static_assert(!lease::access::detail::map_key<std::set<int>>::value,
+                  "set has key_type but no at() — not map-like");
+    static_assert(!lease::access::detail::is_indexable<std::set<int>>::value,
+                  "set is not indexable (no at(), no operator[](size_t))");
+
+    // Fix #3: dedup unifies type identity.
+    static_assert(std::is_same<shared_access<int, indexed, indexed>,
+                               shared_access<int, indexed>>::value,
+                  "dedup unifies <indexed, indexed> and <indexed> type identity");
+    static_assert(std::is_same<exclusive_access<int, indexed, indexed>,
+                               exclusive_access<int, indexed>>::value,
+                  "dedup unifies exclusive_access type identity");
 
     // Compile-time: key_type resolution.
     static_assert(std::is_same<
@@ -532,7 +540,232 @@ namespace demo {
             assert(ro[2] == 9);
         }
 
+        // --- Auto-inject: make_ro(vec) without <indexed> still gets operator[] ---
+        {
+            std::vector<int> vals{42, 43, 44};
+            auto rw = make_rw(vals);             // no explicit <indexed>
+            auto ro = rw.borrow_ro();
+            assert(ro[0] == 42);                 // operator[] auto-injected
+            assert(ro[2] == 44);
+
+            // Map auto-inject too: ro[key] forwards to at().
+            std::map<std::string, int> m{{"x", 10}};
+            auto mrw = make_rw(m);
+            auto mro = mrw.borrow_ro();
+            assert(mro["x"] == 10);
+        }
+
         std::puts("indexed_test OK");
+    }
+
+// ---- Token security test (Fix #4) ------------------------------------------
+// A decorator with a no-op invalidate() must NOT prevent the proxy from
+// invalidating the source after enable_locking. The proxy owns invalidate()
+// and calls object_storage directly, bypassing all decorators.
+    template <typename Inner, typename Policy>
+    class noop_invalidate_impl : public Inner {
+    public:
+        using value_type = typename Inner::value_type;
+        using policy_type = Policy;
+        using Inner::Inner;
+        noop_invalidate_impl(const noop_invalidate_impl&) noexcept = default;
+        noop_invalidate_impl(noop_invalidate_impl&&) noexcept = default;
+        noop_invalidate_impl& operator=(const noop_invalidate_impl&) = delete;
+        noop_invalidate_impl& operator=(noop_invalidate_impl&&) = delete;
+
+    protected:
+        // Malicious no-op: does not forward to Inner::invalidate().
+        void invalidate() noexcept { /* trap */ }
+    };
+
+    struct noop_invalidate {
+        template <typename Inner, typename Policy>
+        using apply = noop_invalidate_impl<Inner, Policy>;
+    };
+
+    void token_security_test() {
+        widget w;
+        w.value = 99;
+
+        auto rw = make_rw<noop_invalidate>(w);
+        assert(rw);
+
+        // enable_locking must invalidate the source even though the decorator
+        // has a no-op invalidate(). The proxy bypasses decorators.
+        auto locked = enable_locking(rw);
+        assert(!rw);   // source is dead — object_storage::invalidate() ran
+
+        locked->set(100);
+        assert(w.value == 100);
+
+        std::puts("token_security_test OK");
+    }
+
+// ---- Scoped read/write lambda tests ----------------------------------------
+    void scoped_lambda_test() {
+        // --- bare recipe: write(lambda) + read(lambda) ---
+        {
+            widget w;
+            auto rw = make_rw(w);
+
+            rw.write([&](widget& w) {
+                w.set(42);
+            });
+            assert(w.value == 42);
+
+            // read on rw (via borrow_ro)
+            auto ro = rw.borrow_ro();
+            int val = ro.read([&](const widget& w) {
+                return w.get();
+            });
+            assert(val == 42);
+        }
+
+        // --- locked recipe: write(lambda) checks exclusivity for entire block ---
+        {
+            std::vector<int> vals{5, 3, 1, 4, 2};
+            auto rw = make_rw<read_lock>(vals);
+
+            // std::sort inside write(lambda): no readers can exist, safe to mutate.
+            rw.write([&](std::vector<int>& v) {
+                std::sort(v.begin(), v.end());
+            });
+
+            assert(vals[0] == 1);
+            assert(vals[4] == 5);
+
+            // read(lambda) on locked ro
+            auto ro = rw.borrow_ro();
+            int first = ro.read([&](const std::vector<int>& v) {
+                return v[0];
+            });
+            assert(first == 1);
+        }
+
+        // --- noexcept propagation: noexcept lambda → noexcept write ---
+        {
+            widget w;
+            auto rw = make_rw(w);
+            // C++14: can't use lambda in unevaluated context, so test at runtime.
+            rw.write([](widget& w) noexcept { w.set(7); });
+            assert(w.value == 7);
+            // noexcept propagation verified at runtime: a noexcept lambda
+            // through write() must not throw. (Static_assert with noexcept
+            // function pointer types behaves differently on clang vs gcc.)
+        }
+
+        // --- exception safety: lambda throws, lease state stays consistent ---
+        {
+            widget w;
+            w.value = 77;
+            auto rw = make_rw<read_lock>(w);
+
+            bool threw = false;
+            try {
+                rw.write([&](widget& w) {
+                    w.set(88);
+                    throw std::runtime_error("test");
+                });
+            } catch (const std::runtime_error&) {
+                threw = true;
+            }
+            assert(threw);
+
+            // No scope to leak — lease state is consistent. We can write again.
+            rw->set(99);
+            assert(w.value == 99);
+        }
+
+        std::puts("scoped_lambda_test OK");
+    }
+
+// ---- Unified write admission test ------------------------------------------
+// assign() and operator=(T) must go through write_arrow, not bypass it.
+// Verified via audit decorator: assign/operator= increment access_count,
+// proving they traverse the same decorator write seam as operator->.
+    void assign_admission_test() {
+        widget w;
+        auto rw = make_rw<read_lock, audit>(w);
+
+        // assign() goes through write_arrow → audit counter increments.
+        std::size_t before = rw.access_count();
+        rw.assign(widget{42});
+        assert(rw.access_count() == before + 1);
+        assert(rw->get() == 42);
+
+        // operator=(T) also goes through write_arrow.
+        before = rw.access_count();
+        rw = widget{99};
+        assert(rw.access_count() == before + 1);
+        assert(rw->get() == 99);
+
+        std::puts("assign_admission_test OK");
+    }
+
+// ---- Write order test: decorator side effects only on admitted writes ------
+// write_arrow checks core_valid() and exclusivity BEFORE calling
+// mutable_write_object(). A rejected write must not trigger decorator
+// side effects. Verified via a custom decorator counting seam calls.
+    template <typename Inner, typename Policy>
+    class write_order_impl : public Inner {
+    public:
+        using value_type = typename Inner::value_type;
+        using policy_type = Policy;
+        using Inner::Inner;
+
+        std::size_t write_seam_calls() const noexcept { return seam_calls_; }
+
+    protected:
+        value_type* mutable_write_object() const noexcept {
+            ++seam_calls_;
+            return Inner::mutable_write_object();
+        }
+
+    private:
+        mutable std::size_t seam_calls_ = 0;
+    };
+
+    struct write_order {
+        template <typename Inner, typename Policy>
+        using apply = write_order_impl<Inner, Policy>;
+    };
+
+    void write_order_test() {
+        widget w;
+        w.value = 77;
+
+        // Bare recipe: write_arrow has Locked=false, no exclusivity check.
+        // But core_valid() still gates mutable_write_object().
+        {
+            auto rw = make_rw<write_order>(w);
+            assert(rw.write_seam_calls() == 0);
+
+            rw->set(1);
+            assert(rw.write_seam_calls() == 1);
+        }
+
+        // Locked recipe: exclusivity check gates the seam.
+        {
+            auto rw = make_rw<read_lock, write_order>(w);
+            assert(rw.write_seam_calls() == 0);
+
+            rw->set(2);
+            assert(rw.write_seam_calls() == 1);
+
+            {
+                auto ro = rw.borrow_ro();  // refcount = 2
+                // rw->set(3) would abort here (refcount > 1).
+                // The seam_calls_ counter would NOT increment because
+                // is_exclusive() fails before mutable_write_object().
+                assert(rw.write_seam_calls() == 1);
+            }
+
+            // After ro is gone, write works again.
+            rw->set(3);
+            assert(rw.write_seam_calls() == 2);
+        }
+
+        std::puts("write_order_test OK");
     }
 
 } // namespace demo
@@ -545,6 +778,10 @@ int main() {
     demo::shallow_span_test();
     demo::concurrency_test();
     demo::indexed_test();
+    demo::token_security_test();
+    demo::scoped_lambda_test();
+    demo::assign_admission_test();
+    demo::write_order_test();
 
 #if LSE_ACCESS_CHECKING && defined(LSE_ACCESS_VIOLATION)
     demo::widget w;
