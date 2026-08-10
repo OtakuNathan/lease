@@ -1,5 +1,12 @@
 // bench.cpp — cost-model evidence for lease.
 //
+// *** TESTING SEAM ***
+// This file is a measurement harness, not production code. It uses explicit
+// reference captures ([&sp, &sink, ...]) to observe measurement subjects and
+// accumulate results — this is measurement plumbing, not authority access.
+// The lease value-semantics discipline (no reference captures for capability
+// access) applies to production code, not to benchmark scaffolding.
+//
 // Answers two questions:
 //   1. Release path: how cheap is lease compared to the usual alternatives
 //      (shared_ptr, std::shared_mutex, plain reference)?
@@ -38,7 +45,7 @@ struct widget {
 using clock_type = std::chrono::steady_clock;
 
 template <typename F>
-double measure_ns(size_t iters, F&& f) {
+double measure_ns(size_t iters, F f) {
     const auto t0 = clock_type::now();
     f();
     const auto t1 = clock_type::now();
@@ -64,7 +71,7 @@ double bench_shared_ptr_read(size_t iters) {
     auto sp = std::make_shared<widget>();
     sp->value = 7;
     int sink = 0;
-    const double ns = measure_ns(iters, [&] {
+    const double ns = measure_ns(iters, [&sp, iters, &sink] {
         for (size_t i = 0; i < iters; ++i) {
             auto s = sp;        // atomic refcount increment
             sink += s->get();   // atomic load through control block
@@ -82,7 +89,7 @@ double bench_lease_bare_read(size_t iters) {
     auto rw = lease::access::make_rw(w);
     rw->set(7);
     int sink = 0;
-    const double ns = measure_ns(iters, [&] {
+    const double ns = measure_ns(iters, [&rw, iters, &sink] {
         for (size_t i = 0; i < iters; ++i) {
             auto ro = rw.borrow_ro();  // plain copy
             sink += ro->get();         // plain load
@@ -93,14 +100,14 @@ double bench_lease_bare_read(size_t iters) {
     return ns;
 }
 
-// lease, read_lock recipe: borrow + copy is one atomic fetch_add, release is
+// lease, shared recipe: borrow + copy is one atomic fetch_add, release is
 // one fetch_sub. This is the explicit price of crossing threads.
-double bench_lease_locked_read(size_t iters) {
+double bench_lease_shared_read(size_t iters) {
     widget w;
-    auto rw = lease::access::make_rw<lease::access::read_lock>(w);
+    auto rw = lease::access::make_rw<lease::access::shared>(w);
     rw->set(7);
     int sink = 0;
-    const double ns = measure_ns(iters, [&] {
+    const double ns = measure_ns(iters, [&rw, iters, &sink] {
         for (size_t i = 0; i < iters; ++i) {
             auto ro = rw.borrow_ro();  // atomic fetch_add(reader_unit)
             sink += ro->get();         // plain load
@@ -118,7 +125,7 @@ double bench_shared_mutex_read(size_t iters) {
     widget w;
     std::shared_mutex m;
     int sink = 0;
-    const double ns = measure_ns(iters, [&] {
+    const double ns = measure_ns(iters, [&m, &w, iters, &sink] {
         for (size_t i = 0; i < iters; ++i) {
             std::shared_lock<std::shared_mutex> lk(m);
             sink += w.get();
@@ -134,7 +141,7 @@ double bench_shared_mutex_read(size_t iters) {
 double bench_lease_bare_write(size_t iters) {
     widget w;
     auto rw = lease::access::make_rw(w);
-    const double ns = measure_ns(iters, [&] {
+    const double ns = measure_ns(iters, [&rw, iters] {
         for (size_t i = 0; i < iters; ++i) {
             rw->set(static_cast<int>(i));  // plain store
             NO_FOLD;
@@ -144,10 +151,10 @@ double bench_lease_bare_write(size_t iters) {
     return ns;
 }
 
-double bench_lease_locked_write(size_t iters) {
+double bench_lease_shared_write(size_t iters) {
     widget w;
-    auto rw = lease::access::make_rw<lease::access::read_lock>(w);
-    const double ns = measure_ns(iters, [&] {
+    auto rw = lease::access::make_rw<lease::access::shared>(w);
+    const double ns = measure_ns(iters, [&rw, iters] {
         for (size_t i = 0; i < iters; ++i) {
             rw->set(static_cast<int>(i));  // CAS acquire + CAS release
             NO_FOLD;
@@ -160,7 +167,7 @@ double bench_lease_locked_write(size_t iters) {
 double bench_shared_mutex_write(size_t iters) {
     widget w;
     std::shared_mutex m;
-    const double ns = measure_ns(iters, [&] {
+    const double ns = measure_ns(iters, [&m, &w, iters] {
         for (size_t i = 0; i < iters; ++i) {
             std::unique_lock<std::shared_mutex> lk(m);
             w.set(static_cast<int>(i));
@@ -178,9 +185,9 @@ double bench_shared_mutex_write(size_t iters) {
 
 double bench_lease_root_create(size_t iters) {
     widget w;
-    const double ns = measure_ns(iters, [&] {
+    const double ns = measure_ns(iters, [&w, iters] {
         for (size_t i = 0; i < iters; ++i) {
-            auto rw = lease::access::make_rw<lease::access::read_lock>(w);
+            auto rw = lease::access::make_rw<lease::access::shared>(w);
             rw->set(1);
             NO_FOLD;
         }
@@ -190,7 +197,7 @@ double bench_lease_root_create(size_t iters) {
 }
 
 double bench_shared_ptr_create(size_t iters) {
-    const double ns = measure_ns(iters, [&] {
+    const double ns = measure_ns(iters, [iters] {
         for (size_t i = 0; i < iters; ++i) {
             auto sp = std::make_shared<widget>();
             sp->set(1);
@@ -238,11 +245,11 @@ int main() {
 
     run("read: shared_ptr copy", bench_shared_ptr_read(K));
     run("read: lease bare", bench_lease_bare_read(K));
-    run("read: lease read_lock", bench_lease_locked_read(K));
+    run("read: lease shared", bench_lease_shared_read(K));
     run("read: std::shared_mutex", bench_shared_mutex_read(K));
 
     run("write: lease bare", bench_lease_bare_write(K));
-    run("write: lease read_lock", bench_lease_locked_write(K));
+    run("write: lease shared", bench_lease_shared_write(K));
     run("write: std::shared_mutex", bench_shared_mutex_write(K));
 
     constexpr size_t C = 1'000'000;

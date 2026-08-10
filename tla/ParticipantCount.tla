@@ -14,7 +14,10 @@ EXTENDS Naturals
   Thread model:
     - rw is thread-confined (only its owning thread calls borrow_ro / write)
     - ro copies may live on other threads
-    - borrow_ro does not happen during a write expression (same thread, sequential)
+    - borrow_ro does not happen during a write expression (environment /
+      API discipline: lease replaces raw references, write lambdas must
+      not capture the rw proxy by reference — this is a caller obligation,
+      not a runtime-synchronized path)
     - ro release may happen from any thread, at any time (including during write)
 *)
 

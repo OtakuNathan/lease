@@ -10,7 +10,7 @@
 //   - shared_access / exclusive_access aliases
 //   - make_ro / make_rw factories
 //
-// Destructive conversions (enable_locking(), downgrade()) take no &&: like
+// Destructive conversions (enable_shared(), downgrade()) take no &&: like
 // unique_ptr::release(), they are callable on lvalues, invalidate the source
 // handle immediately, and any later use of that handle is a contract
 // violation — never silent UB.
@@ -75,6 +75,28 @@ namespace access {
 
             using type = typename materialize_recipe<
                     T, Policy, type_list<Decorators...>>::type;
+
+            // ---- Materialized capability contract ----
+            // Verify the FINAL composed type (D1<D2<...<track<object_storage<T>>>>>)
+            // satisfies lease's nothrow capability algebra. This is the real gate:
+            // individual decorator_probe checks are diagnostic; this is enforcement.
+            // It fires automatically for every proxy instantiation, user or built-in.
+            //
+            // Policy-sensitive: rw is unique/affine (move-only), ro is shareable
+            // (copyable). Only require what the authority model actually needs.
+            static_assert(
+                std::is_nothrow_constructible<type, T*, lineage_control*>::value,
+                "materialized capability must be nothrow constructible from "
+                "(T*, lineage_control*) — topology operations are noexcept");
+            static_assert(
+                std::is_same<Policy, rw_tag>::value ||
+                std::is_nothrow_copy_constructible<type>::value,
+                "read capability must be nothrow copy-constructible "
+                "— borrow_ro/downgrade/ro copy are unconditional noexcept");
+            static_assert(
+                std::is_nothrow_move_constructible<type>::value,
+                "materialized capability must be nothrow move-constructible "
+                "— proxy move is unconditional noexcept");
         };
 
         template <typename T, typename Policy, typename List>
@@ -85,7 +107,7 @@ namespace access {
 //
 // In the intrusive refcount model, exclusivity is checked at construction:
 // refcount == 1 means only the rw holder exists. No writer bit, no CAS
-// loop, no scope object — the count IS the lock.
+// loop, no scope object — the count IS the exclusivity check.
 //
 // Check order (critical for safety):
 //   1. core_valid() — spent-token check via object_storage directly
@@ -98,14 +120,22 @@ namespace access {
 //      admission succeeds, so decorator side effects (e.g. audit counter)
 //      never fire on a rejected write.
 //
-// The Locked template parameter: bare recipes (Locked=false) have no
-// control block, so the exclusivity check is skipped. Locked recipes
-// (Locked=true) always check refcount == 1.
+// The Shared template parameter: bare recipes (Shared=false) have no
+// control block, so the exclusivity check is skipped. Shared recipes
+// (Shared=true) always check refcount == 1.
+//
+// Reentrancy contract: the rw holder must not reenter — no nested write
+// expression, no borrow_ro(), no downgrade(), no move — while a write
+// expression (operator->, write(lambda), assign) is active. The rw holder
+// is the sole thread that can create the first ro, so no external thread
+// can violate this. lease replaces raw references; write lambdas must not
+// capture the rw proxy by reference. Violating this is a contract breach,
+// not a runtime-synchronized path.
 // ============================================================
         template <typename T, typename DecoratorList, typename Policy>
         class proxy;
 
-        template <typename T, bool Locked>
+        template <typename T, bool Shared>
         class write_arrow {
         public:
             template <typename DL>
@@ -117,15 +147,28 @@ namespace access {
                 if (!proxy_ref.core_valid()) {
                     contract_violation("using a spent exclusive_access");
                 }
-                // Step 2: exclusivity check — always compiled (one atomic load).
+                // Step 2: exclusivity check.
                 // Uses core_control() from root_slot, not the decorator chain.
-                if (Locked) {
+#if LSE_ACCESS_CHECKING
+                // Debug: all recipes check exclusivity. Bare recipes get a
+                // control block in Debug, so orphan readers are caught here.
+                {
+                    auto* ctrl = proxy_ref.core_control();
+                    if (ctrl && !ctrl->is_exclusive()) {
+                        contract_violation(
+                                "write expression while readers are active");
+                    }
+                }
+#else
+                // Release: only shared recipes have a control block to check.
+                if (Shared) {
                     auto* ctrl = proxy_ref.core_control();
                     if (!ctrl || !ctrl->is_exclusive()) {
                         contract_violation(
                                 "write expression while readers are active");
                     }
                 }
+#endif
                 // Step 3: admission passed — NOW invoke the decorator write seam.
                 // Side effects (audit counters, etc.) only fire on admitted writes.
                 object_ = proxy_ref.mutable_write_object();
@@ -173,7 +216,7 @@ namespace access {
                 : private lineage_root_slot,
                   public materialize_t<T, ro_tag, DecoratorList> {
             using impl_type = materialize_t<T, ro_tag, DecoratorList>;
-            static constexpr bool locked = contains<read_lock, DecoratorList>::value;
+            static constexpr bool shared_recipe = contains<shared, DecoratorList>::value;
 
         public:
             using value_type = T;
@@ -212,14 +255,14 @@ namespace access {
             explicit operator bool() const noexcept { return this->valid_object(); }
 
             template <typename F>
-            auto read(F&& f) const
-                noexcept(noexcept(std::declval<F>()(std::declval<const T&>())))
-                -> decltype(std::declval<F>()(std::declval<const T&>())) {
+            auto read(F f) const
+                noexcept(noexcept(std::declval<F&>()(std::declval<const T&>())))
+                -> decltype(std::declval<F&>()(std::declval<const T&>())) {
                 const T* object = this->const_object();
                 if (!object) {
                     contract_violation("reading through an empty shared_access");
                 }
-                return std::forward<F>(f)(*object);
+                return f(*object);
             }
 
         private:
@@ -230,11 +273,13 @@ namespace access {
                     : lineage_root_slot(control),
                       impl_type(object, control) {}
 
-            // Derived ro (borrow_ro): acquires a new reference.
+            // Derived ro (borrow_ro): acquires a new reference in the base
+            // (lineage_construct_tag ctor). The materialized-type contract
+            // (materialize_list static_assert) guarantees the full decorator
+            // chain is nothrow constructible, so this is unconditionally safe.
             proxy(lineage_construct_tag, T* object, lineage_control* control) noexcept
-                    : lineage_root_slot(control), impl_type(object, control) {
-                if (control) control->acquire();
-            }
+                    : lineage_root_slot(lineage_construct_tag{}, control),
+                      impl_type(object, control) {}
 
             template <typename, typename, typename>
             friend class proxy;
@@ -247,9 +292,9 @@ namespace access {
             -> proxy<U, dedup_t<type_list<Decorators...>>, ro_tag>;
 
             template <typename T2, typename DL2>
-            friend auto enable_locking(
-                proxy<T2, DL2, rw_tag>&) noexcept
-                -> proxy<T2, dedup_t<typename lock_list<DL2>::type>, rw_tag>;
+            friend auto enable_shared(
+                proxy<T2, DL2, rw_tag>&)
+                -> proxy<T2, dedup_t<typename shared_list<DL2>::type>, rw_tag>;
         };
 
         template <typename T, typename DecoratorList>
@@ -257,11 +302,11 @@ namespace access {
                 : private lineage_root_slot,
                   public materialize_t<T, rw_tag, DecoratorList> {
             using impl_type = materialize_t<T, rw_tag, DecoratorList>;
-            static constexpr bool locked = contains<read_lock, DecoratorList>::value;
+            static constexpr bool shared_recipe = contains<shared, DecoratorList>::value;
 
             proxy& assign_value(T&& value)
                 noexcept(std::is_nothrow_assignable<T&, T&&>::value) {
-                write_arrow<T, locked> guard(*this);
+                write_arrow<T, shared_recipe> guard(*this);
                 *guard = std::move(value);
                 return *this;
             }
@@ -280,16 +325,16 @@ namespace access {
 
             ~proxy() = default;
 
-            write_arrow<T, locked> operator->() noexcept {
-                return write_arrow<T, locked>(*this);
+            write_arrow<T, shared_recipe> operator->() noexcept {
+                return write_arrow<T, shared_recipe>(*this);
             }
 
             template <typename F>
-            auto write(F&& f)
-                noexcept(noexcept(std::declval<F>()(std::declval<T&>())))
-                -> decltype(std::declval<F>()(std::declval<T&>())) {
-                write_arrow<T, locked> guard(*this);
-                return std::forward<F>(f)(*guard);
+            auto write(F f)
+                noexcept(noexcept(std::declval<F&>()(std::declval<T&>())))
+                -> decltype(std::declval<F&>()(std::declval<T&>())) {
+                write_arrow<T, shared_recipe> guard(*this);
+                return f(*guard);
             }
 
             template <typename U = T, std::enable_if_t<std::is_assignable<U&, U&&>::value>* = nullptr>
@@ -321,13 +366,9 @@ namespace access {
             // ro acquires a new reference via core_control() (root_slot's
             // authoritative pointer, not the decorator chain).
             //
-            // Reentrancy contract: borrow_ro() must NOT be called from inside
-            // a write expression (operator->, write(lambda), assign). The rw
-            // holder is the only thread that can create the first ro, so no
-            // external thread can violate this — but the rw holder itself can
-            // reenter. Doing so would create a reader during a write, which
-            // the next write_arrow would catch (refcount > 1 → abort). This is
-            // a contract violation, not a runtime-synchronized path.
+            // Contract: must NOT be called from inside a write expression.
+            // lease replaces raw references; write lambdas must not capture
+            // the rw proxy by reference. Violating this is a contract breach.
             ro_type borrow_ro() const noexcept {
                 T* object = this->mutable_object();
                 if (!object) {
@@ -337,31 +378,30 @@ namespace access {
                         lineage_construct_tag{}, object, this->core_control());
             }
 
-            // Destructive downgrade: rw dies, ro is born. The root_slot's
-            // reference is transferred (move, not acquire) — refcount unchanged.
-            // detach_control() transfers the pointer and clears root_slot.
-            // invalidate() then clears object + track_impl's observational
-            // pointer. The source handle is fully spent; any later use is a
-            // contract violation, never silent UB.
+            // Destructive downgrade: rw dies, ro is born.
+            //
+            // Construct ro first (acquire +1), then release rw's ref (-1, net
+            // zero). The materialized-type contract (materialize_list static_assert)
+            // guarantees the full chain is nothrow, so this is unconditional noexcept.
             ro_type downgrade() noexcept {
                 T* object = this->mutable_object();
                 if (!object) {
                     contract_violation("downgrading an empty exclusive_access");
                 }
 
-                lineage_control* control = this->detach_control();
+                lineage_control* control = this->core_control();
 
                 if (!control) {
-                    // Bare path: no control block, just transfer the referent.
+                    // Bare Release path: no control block, just transfer.
                     ro_type result(lineage_construct_tag{}, object, nullptr);
                     this->invalidate();
                     return result;
                 }
 
-                // Locked path: root_slot's reference transferred to ro.
-                // root_construct_tag ctor inherits the refcount (pointer ctor,
-                // no acquire). detach_control() already cleared root_slot.
-                ro_type result(root_construct_tag{}, object, control);
+                // Shared/Debug path: construct ro first (acquire +1), then
+                // release rw's reference (-1, net zero).
+                ro_type result(lineage_construct_tag{}, object, control);
+                this->detach_control()->release();
                 this->invalidate();
                 return result;
             }
@@ -398,9 +438,9 @@ namespace access {
             friend class write_arrow;
 
             template <typename T2, typename DL2>
-            friend auto enable_locking(
-                proxy<T2, DL2, rw_tag>&) noexcept
-                -> proxy<T2, dedup_t<typename lock_list<DL2>::type>, rw_tag>;
+            friend auto enable_shared(
+                proxy<T2, DL2, rw_tag>&)
+                -> proxy<T2, dedup_t<typename shared_list<DL2>::type>, rw_tag>;
 
             template <typename... Decorators, typename U>
             friend auto make_rw(U& object)
@@ -424,12 +464,22 @@ namespace access {
                           "make_ro requires an object type, not an array or function");
             using D = dedup_t<type_list<Decorators...>>;
 
-            constexpr bool free = !contains<read_lock, D>::value;
+            constexpr bool free = !contains<shared, D>::value;
             if (free) {
+#if LSE_ACCESS_CHECKING
+                // Debug: bare also gets a control block for orphan-reader
+                // detection. Release: bare is truly bare (no control block).
+                auto* control = new lineage_control(std::addressof(object));
+                return proxy<T, D, ro_tag>(
+                        root_construct_tag{},
+                        std::addressof(object),
+                        control);
+#else
                 return proxy<T, D, ro_tag>(
                         root_construct_tag{},
                         std::addressof(object),
                         nullptr);
+#endif
             }
 
             auto* control = new lineage_control(std::addressof(object));
@@ -449,12 +499,20 @@ namespace access {
                           "make_rw requires an object type, not an array or function");
             using D = dedup_t<type_list<Decorators...>>;
 
-            constexpr bool free = !contains<read_lock, D>::value;
+            constexpr bool free = !contains<shared, D>::value;
             if (free) {
+#if LSE_ACCESS_CHECKING
+                auto* control = new lineage_control(std::addressof(object));
+                return proxy<T, D, rw_tag>(
+                        root_construct_tag{},
+                        std::addressof(object),
+                        control);
+#else
                 return proxy<T, D, rw_tag>(
                         root_construct_tag{},
                         std::addressof(object),
                         nullptr);
+#endif
             }
 
             auto* control = new lineage_control(std::addressof(object));
@@ -466,27 +524,64 @@ namespace access {
         }
 
 // ============================================================
-// enable_locking: bare exclusive_access -> locked exclusive_access.
+// enable_shared: bare exclusive_access -> shared exclusive_access.
 //
-// Destructive: the source proxy is invalidated. The locked proxy gets a
-// fresh control block (refcount=1).
+// Destructive: the source proxy is invalidated.
+//
+// Strong exception guarantee via speculative-acquire pattern:
+//   prepare → construct → commit
+// All rollback is handled by RAII (lineage_root_slot destructor).
+// No manual catch blocks — the root_slot IS the cleanup.
+//
+// Control-block strategy:
+//   - Existing control (Debug bare): acquire a speculative ref (+1),
+//     construct shared proxy adopting it. If construction throws, the
+//     proxy's root_slot destructor releases the speculative ref (net 0).
+//     rw's original ref is untouched. On success, detach rw's ref (-1).
+//   - No control (Release bare): allocate new control (refcount=1),
+//     construct. If construction throws, root_slot destructor releases
+//     the initial ref → refcount 0 → self-delete. rw untouched.
 // ============================================================
         template <typename T, typename DecoratorList>
-        auto enable_locking(
-            proxy<T, DecoratorList, rw_tag>& rw) noexcept
-            -> proxy<T, dedup_t<typename lock_list<DecoratorList>::type>, rw_tag> {
-            static_assert(!contains<read_lock, DecoratorList>::value,
-                          "enable_locking requires a bare (unlocked) exclusive_access");
-            using locked_proxy =
-                proxy<T, dedup_t<typename lock_list<DecoratorList>::type>, rw_tag>;
+        auto enable_shared(
+            proxy<T, DecoratorList, rw_tag>& rw)
+            -> proxy<T, dedup_t<typename shared_list<DecoratorList>::type>, rw_tag> {
+            static_assert(!contains<shared, DecoratorList>::value,
+                          "enable_shared requires a bare (non-shared) exclusive_access");
+            using shared_proxy =
+                proxy<T, dedup_t<typename shared_list<DecoratorList>::type>, rw_tag>;
 
             T* object = rw.mutable_object();
             if (!object) {
-                contract_violation("locking an empty exclusive_access");
+                contract_violation("sharing an empty exclusive_access");
             }
 
-            auto* control = new lineage_control(object);
-            locked_proxy result(root_construct_tag{}, object, control);
+            lineage_control* control = rw.core_control();
+
+            if (control) {
+                // Existing control (Debug bare): check exclusivity before
+                // proceeding. An orphan reader (borrow_ro still alive) means
+                // the lineage is not exclusive — sharing it would be unsound.
+                if (!control->is_exclusive()) {
+                    contract_violation(
+                            "enable_shared while readers are active");
+                }
+                // Acquire speculative ref, construct, then commit by
+                // releasing rw's ref. RAII handles rollback: if construction
+                // throws, the proxy's root_slot destructor releases the
+                // speculative ref. rw is untouched (strong exception guarantee).
+                control->acquire();
+                shared_proxy result(root_construct_tag{}, object, control);
+                rw.detach_control()->release();
+                rw.invalidate();
+                return result;
+            }
+
+            // Release bare: no control block. Allocate new one.
+            // RAII handles rollback: if construction throws, root_slot
+            // destructor releases the initial ref → self-delete. rw untouched.
+            auto* new_control = new lineage_control(object);
+            shared_proxy result(root_construct_tag{}, object, new_control);
             rw.invalidate();
             return result;
         }

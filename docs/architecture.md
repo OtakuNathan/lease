@@ -10,25 +10,25 @@ reference; it explains *why the pieces are where they are*.
 | **Resource** | The object `T` you want to protect. lease never copies or moves it — it only governs access. | caller's storage |
 | **Policy** | The access mode: `ro_tag` (shared, read-only projection) or `rw_tag` (unique, mutable projection). | compile-time tag |
 | **Facade** | `shared_access<T>` / `exclusive_access<T>` — what the user actually holds. Inherits root slot, projects `const T*` / `T*`, and implements the management verbs (`borrow_ro`, `downgrade`, `clone`, `write`, `read`). | `lease_facade.hpp` |
-| **Decorator** | A compile-time policy layer that wraps the chain below it via the `apply` seam. `read_lock` is the only built-in; users add their own (`indexed`, `audit`, etc.). | `lease_decorators.hpp` |
-| **Control Block** | `lineage_control` — the heap object holding the intrusive refcount and the Debug provenance entry. One per locked lineage. | `lease_storage.hpp` |
+| **Decorator** | A compile-time policy layer that wraps the chain below it via the `apply` seam. `shared` is the only built-in; users add their own (`indexed`, `audit`, etc.). | `lease_decorators.hpp` |
+| **Control Block** | `lineage_control` — the heap object holding the intrusive refcount and the Debug provenance entry. One per shared lineage. | `lease_storage.hpp` |
 | **Lease** | The semantic model itself: access is *borrowed*, not owned. Every handle either owns the root reference or holds a counted share, and every share must be returned. | the whole library |
 
 ## The type chain (materialization)
 
-A recipe `make_rw<read_lock>(w)` is a `type_list<read_lock>` that
+A recipe `make_rw<shared>(w)` is a `type_list<shared>` that
 materializes into a concrete impl type. User decorators list outside-in;
 `track` and `object_storage` are mandatory and implicit:
 
 ```
-exclusive_access<widget, type_list<read_lock>>
+exclusive_access<widget, type_list<shared>>
 │  └─ lineage_root_slot              (raw pointer to lineage_control — RAII reference)
-│  └─ read_lock_impl<Inner, rw_tag>  (recipe marker: drives locked write path)
+│  └─ shared_impl<Inner, rw_tag>  (recipe marker: drives shared write path)
 │       └─ track_impl<...>           (mandatory: anchors observational control pointer)
 │            └─ object_storage<widget> (terminal: owns the raw referent pointer)
 ```
 
-A bare recipe `make_rw(w)` is the same chain minus `read_lock_impl` — and
+A bare recipe `make_rw(w)` is the same chain minus `shared_impl` — and
 minus the heap block, the atomics, and the registry entry. That is the whole
 cost story in one diagram: **the decorator list IS the cost model.**
 
@@ -42,7 +42,7 @@ cost story in one diagram: **the decorator list IS the cost model.**
         ┌──────────────┴───────────────┐
         │       object_storage<T>      │
         └──────────────▲───────────────┘
-                       │ decorated by read_lock (optional) and track (mandatory)
+                       │ decorated by shared (optional) and track (mandatory)
         ┌──────────────┴───────────────┐
         │        proxy facade          │
         │  lineage_root_slot           │── references ──► ┌──────────────────────┐
@@ -60,13 +60,19 @@ cost story in one diagram: **the decorator list IS the cost model.**
   the destructor (refcount -= 1; if 0, self-deletes).
 - Derived readers (borrow_ro, ro copy) acquire a new reference via the
   `lineage_root_slot` copy constructor: `control_->acquire()` (+1).
-- Destructive transfers (downgrade, enable_locking) move the pointer without
-  acquire/release — refcount unchanged.
+- Destructive transfers: `downgrade` constructs a fresh ro (acquire +1,
+  then release rw's ref, net zero). `enable_shared` in Release creates a
+  fresh control block (bare had none). In Debug, bare already has a control
+  block; `enable_shared` reuses it via speculative acquire (acquire +1,
+  construct, then release rw's ref). Exclusivity is checked before the
+  transfer — an orphan reader blocks `enable_shared`.
 - When refcount reaches 0, `lineage_control` self-deletes and cleans up the
   Debug provenance entry. No `shared_ptr`, no external refcount — the control
   block IS the refcount.
-- `enable_locking()` is the lazy-lineage seam: a bare root holds no control
-  block at all; the shared era begins exactly when `enable_locking()` allocates it.
+- `enable_shared()` is the lazy-lineage seam (Release-only): a bare root
+  holds no control block in Release; the participant-count era begins exactly
+  when `enable_shared()` allocates it. In Debug, bare roots already carry a
+  control block for orphan-reader detection.
 
 ## The intrusive refcount model
 
@@ -78,16 +84,18 @@ deletes itself.
 Write authority: `refcount == 1` means only the rw holder exists — exclusive
 by construction. `refcount > 1` means readers are active → contract violation.
 
-No writer bit, no root bit, no CAS loop, no backoff. **The count IS the lock.**
+No writer bit, no root bit, no CAS loop, no backoff. **The count IS the exclusivity check.**
 
 ### Authority lifecycle
 
 | Operation | refcount change | How |
 |---|---|---|
-| `make_rw<read_lock>` / `make_ro<read_lock>` | = 1 | `new lineage_control` (ctor sets refcount=1) |
-| `enable_locking(bare)` | = 1 | same: fresh control block |
-| `borrow_ro` / ro copy | +1 | `root_slot` copy ctor → `acquire()` |
-| `downgrade` | unchanged | `detach_control()` — move, not copy |
+| `make_rw<shared>` / `make_ro<shared>` | = 1 | `new lineage_control` (ctor sets refcount=1) |
+| `enable_shared(bare)` Release | = 1 | fresh control block (bare had none) |
+| `enable_shared(bare)` Debug | unchanged | reuses existing control via speculative acquire |
+| `borrow_ro` | +1 | `lineage_construct_tag` ctor → `acquire()` (fresh ro chain) |
+| ro copy | +1 | `root_slot` copy ctor → `acquire()` (copied ro chain) |
+| `downgrade` | net 0 | construct ro (acquire +1), then release rw's ref (-1) |
 | rw destroy | -1 | `~root_slot` → `release()` |
 | ro root destroy | -1 | same |
 | non-root ro destroy | -1 | same |
@@ -110,7 +118,7 @@ ro->get()
 ```
 rw->set(7)
  │
- ├─ write_arrow<T, locked> constructed
+ ├─ write_arrow<T, shared_recipe> constructed
  │    ├─ Step 1: core_valid() — spent-token check via object_storage
  │    │    directly (NOT through decorator chain). A spent proxy aborts here.
  │    ├─ Step 2: exclusivity check via core_control() (root_slot's
@@ -166,9 +174,9 @@ after the control block has been released.
 decorator impls, facade). They decide:
 
 - which `proxy` specialization is instantiated (`ro_tag` → const projection);
-- how `read_lock_impl` behaves (ro: pure marker; rw: pure marker — refcount
-  is managed by `lineage_root_slot`, not by `read_lock`);
-- which verbs exist (`enable_locking()` is `static_assert`'d to bare
+- how `shared_impl` behaves (ro: pure marker; rw: pure marker — refcount
+  is managed by `lineage_root_slot`, not by `shared`);
+- which verbs exist (`enable_shared()` is `static_assert`'d to bare
   `rw_tag` recipes).
 
 The tag is part of the type, which is the entire point: **access mode is

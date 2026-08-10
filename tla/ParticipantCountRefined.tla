@@ -30,8 +30,8 @@ EXTENDS Naturals
       ro's reference (intrusive: one object = one refcount)
 
   Authority lifecycle (C++ entry points):
-    make_rw<read_lock>:  rootAlive=T, rootMode="rw", count=1
-    make_ro<read_lock>:  rootAlive=T, rootMode="ro", count=1
+    make_rw<shared>:  rootAlive=T, rootMode="rw", count=1
+    make_ro<shared>:  rootAlive=T, rootMode="ro", count=1
     borrow_ro / ro copy: readers++, count++ (root_slot copy ctor acquires)
     downgrade:           rootMode "rw"->"ro", count unchanged (move, not copy)
     rw destroy:          rootAlive=F, rootMode="none", count--
@@ -57,10 +57,13 @@ Init ==
         /\ count = 1
 
 (* Add a reader participant (borrow_ro from rw, or copy from any ro).
-   Guard ~writing: the contract forbids creating readers during a write
-   expression. In C++ this is enforced by is_exclusive() at write_arrow
-   construction (always compiled — one atomic load); the model enforces
-   it at every step. *)
+   Guard ~writing: environment / API discipline assumption — no
+   authority-reentering operation occurs while a raw access expression
+   is active. lease replaces raw references; write lambdas must not
+   capture the rw proxy by reference. The model verifies that under
+   this legal-call-sequence contract, the refcount implementation
+   refines the authority model. C++ does NOT runtime-enforce this
+   guard; it is a caller obligation, not a synchronized path. *)
 AddReader ==
   /\ count > 0
   /\ ~writing

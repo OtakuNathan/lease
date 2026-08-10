@@ -26,13 +26,39 @@
 // write expressions to resolve the referent — override it to observe/update
 // state for each write expression.
 //
+// Decorator state ownership / lifetime:
+//   Decorator members are per-proxy-instance value members — NOT shared
+//   across proxies, NOT reference-counted, NOT heap-allocated separately.
+//
+//   Same-type operations follow normal C++ value semantics:
+//     ro copy             → state COPIED (snapshot at copy time)
+//     proxy move          → state MOVED (source invalidated)
+//
+//   Cross-policy projections (rw → ro) construct FRESH target-side state:
+//     borrow_ro / downgrade → fresh ro-side decorator chain constructed
+//     from (object, control), NOT copied from the rw-side chain.
+//
+//   This is intentional: rw_tag and ro_tag decorator impls may have
+//   different structures, and a cross-policy conversion seam would create
+//   a cartesian product of copy/move paths. Instead, decorator state
+//   belongs to a concrete capability value. Lineage-wide state (refcount,
+//   exclusivity, provenance) lives entirely in lineage_control +
+//   lineage_root_slot, never in decorator members.
+//
+//   `mutable` members are allowed (for observation counters on const ro
+//   proxies), but write-path overrides (mutable_write_object) only fire on
+//   rw through write_arrow — never on ro.
+//
 // Every decorator MUST satisfy the contract checked by decorator_probe at the
 // bottom of this file:
 //   1. expose the apply seam;
 //   2. declare value_type matching the referent type and policy_type;
-//   3. be constructible from (value_type*, lineage_control*);
-//   4. be copy-constructible (derived readers are copies);
-//   5. never be assignable (authority must not be duplicated by assignment).
+//   3. be nothrow constructible from (value_type*, lineage_control*);
+//   4. ro_tag: be nothrow copy-constructible; rw_tag: no copy required;
+//   5. be nothrow move-constructible;
+//   6. never be assignable (authority must not be duplicated by assignment).
+// The final composed type is also checked at materialization time
+// (materialize_list static_asserts) — that is the real enforcement gate.
 // `probe` below is the minimal valid example — copy it to start a new
 // decorator, then add a decorator_probe static_assert for the new type.
 // ============================================================================
@@ -50,60 +76,60 @@ namespace lease {
 namespace access {
 
 // ============================================================
-// Optional read lock decorator.
+// Optional shared decorator.
 //
-// read_lock is the explicit opt-in for the multi-threaded mode. Explicit
-// beats implicit: a bare recipe (no read_lock) is single-threaded and free —
-// no atomics, no heap control block, no registry entry. Listing read_lock
-// arms the shared era: participant counting is atomic and write expressions
+// `shared` is the explicit opt-in for the multi-threaded mode. Explicit
+// beats implicit: a bare recipe (no `shared`) is single-threaded and free —
+// no atomics, no heap control block, no registry entry. Listing `shared`
+// arms the participant-count era: counting is atomic and write expressions
 // check exclusivity (count == 1) in Debug.
 //
-// Lock rule (compile-time enforced):
-//   an exclusive_access without read_lock may be passed to enable_locking()
-//   to obtain a locked one; calling enable_locking() on an already-locked
+// Sharing rule (compile-time enforced):
+//   an exclusive_access without `shared` may be passed to enable_shared()
+//   to obtain a shared one; calling enable_shared() on an already-shared
 //   proxy triggers a static_assert, and no reverse conversion exists — it
 //   can never silently weaken back.
 // ============================================================
         template <typename Inner, typename Policy>
-        class read_lock_impl;
+        class shared_impl;
 
-// Locked read-share decorator. Pure recipe marker — does NOT participate
+// Shared read decorator. Pure recipe marker — does NOT participate
 // in refcounting. The lineage_root_slot base handles acquire/release.
-// read_lock's presence in the recipe drives the locked path (control block
+// `shared`'s presence in the recipe drives the shared path (control block
 // exists, write_arrow checks exclusivity in Debug).
         template <typename Inner>
-        class read_lock_impl<Inner, ro_tag> : public Inner {
+        class shared_impl<Inner, ro_tag> : public Inner {
         public:
             using value_type = typename Inner::value_type;
             using policy_type = ro_tag;
             using Inner::Inner;
 
-            read_lock_impl(const read_lock_impl&) noexcept = default;
-            read_lock_impl(read_lock_impl&&) noexcept = default;
-            read_lock_impl& operator=(const read_lock_impl&) = delete;
-            read_lock_impl& operator=(read_lock_impl&&) = delete;
+            shared_impl(const shared_impl&) noexcept = default;
+            shared_impl(shared_impl&&) noexcept = default;
+            shared_impl& operator=(const shared_impl&) = delete;
+            shared_impl& operator=(shared_impl&&) = delete;
         };
 
-// rw-side read_lock is a pure recipe marker: an exclusive proxy's write
+// rw-side `shared` is a pure recipe marker: an exclusive proxy's write
 // expressions check refcount for exclusivity. Its presence in the
-// recipe drives the locked path (control block exists).
+// recipe drives the shared path (control block exists).
         template <typename Inner>
-        class read_lock_impl<Inner, rw_tag> : public Inner {
+        class shared_impl<Inner, rw_tag> : public Inner {
         public:
             using value_type = typename Inner::value_type;
             using policy_type = rw_tag;
             using Inner::Inner;
         };
 
-        struct read_lock {
+        struct shared {
             template <typename Inner, typename Policy>
-            using apply = read_lock_impl<Inner, Policy>;
+            using apply = shared_impl<Inner, Policy>;
         };
 
-// enable_locking() target recipe: the source recipe plus read_lock at the head.
+// enable_shared() target recipe: the source recipe plus `shared` at the head.
         template <typename L>
-        struct lock_list {
-            using type = typename prepend<read_lock, L>::type;
+        struct shared_list {
+            using type = typename prepend<shared, L>::type;
         };
 
 // ============================================================
@@ -165,15 +191,15 @@ namespace access {
             // Map path forwards to at() (const-safe, throws on missing key);
             // sequence path forwards to operator[] (const overload exists).
             template <typename T, typename Key>
-            auto do_index(const T& obj, Key&& k, std::true_type /*is_map*/)
-                -> decltype(obj.at(std::forward<Key>(k))) {
-                return obj.at(std::forward<Key>(k));
+            auto do_index(const T& obj, Key k, std::true_type /*is_map*/)
+                -> decltype(obj.at(k)) {
+                return obj.at(k);
             }
 
             template <typename T, typename Key>
-            auto do_index(const T& obj, Key&& k, std::false_type /*is_map*/)
-                -> decltype(obj[std::forward<Key>(k)]) {
-                return obj[std::forward<Key>(k)];
+            auto do_index(const T& obj, Key k, std::false_type /*is_map*/)
+                -> decltype(obj[k]) {
+                return obj[k];
             }
 
         } // namespace detail
@@ -209,7 +235,7 @@ namespace access {
                 if (!obj) {
                     contract_violation("indexing through an empty shared_access");
                 }
-                return detail::do_index(*obj, std::move(k),
+                return detail::do_index(*obj, k,
                         std::integral_constant<bool, detail::map_key<value_type>::value>{});
             }
         };
@@ -297,9 +323,19 @@ namespace access {
             static_assert(detail::ctor_ok<Impl>::value,
                           "decorator impl must be constructible from "
                           "(value_type*, lineage_control*)");
-            static_assert(std::is_copy_constructible<Impl>::value,
-                          "decorator impl must be copy-constructible "
-                          "(derived readers are copies)");
+            static_assert(
+                std::is_nothrow_constructible<Impl,
+                    typename Impl::value_type*, lineage_control*>::value,
+                "decorator capability construction must be nothrow "
+                "(topology operations are unconditional noexcept)");
+            static_assert(
+                std::is_same<Policy, rw_tag>::value ||
+                std::is_nothrow_copy_constructible<Impl>::value,
+                "read-capability decorator impl must be nothrow copy-constructible "
+                "(borrow_ro/downgrade/ro copy are unconditional noexcept)");
+            static_assert(std::is_nothrow_move_constructible<Impl>::value,
+                          "decorator impl must be nothrow move-constructible "
+                          "(proxy move is unconditional noexcept)");
             static_assert(!std::is_copy_assignable<Impl>::value &&
                                   !std::is_move_assignable<Impl>::value,
                           "decorator impl must never be assignable");
@@ -341,8 +377,8 @@ namespace access {
         };
 
 // ---- Built-in decorator self-checks (extension point gate) -----------------
-        static_assert(decorator_probe<read_lock, int, ro_tag>::value,
-                      "read_lock must satisfy the decorator contract");
+        static_assert(decorator_probe<shared, int, ro_tag>::value,
+                      "shared must satisfy the decorator contract");
         static_assert(decorator_probe<probe, int, ro_tag>::value,
                       "probe must satisfy the decorator contract");
         static_assert(decorator_probe<indexed, int, ro_tag>::value,

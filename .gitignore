@@ -1,4 +1,6 @@
 build/
+build-debug/
+build-release/
 *.o
 *.obj
 tla/states/

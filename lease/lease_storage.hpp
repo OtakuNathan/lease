@@ -105,7 +105,12 @@ namespace access {
 // ============================================================
         class lineage_control final : public pooling_base<lineage_control> {
         public:
-            explicit lineage_control(const void* object) noexcept
+            // Resource preparation, not topology mutation: may throw
+            // (Debug root_registry::acquire does unordered_map::emplace).
+            // This is fine — make_ro/make_rw/enable_shared are allowed to
+            // fail; topology operations (move/borrow/downgrade/release) never
+            // create a lineage_control and remain noexcept.
+            explicit lineage_control(const void* object)
                     : object_(object) {
                 root_registry::acquire(object_, this);
             }
@@ -172,6 +177,14 @@ namespace access {
             // Root construction: inherits the refcount=1 from lineage_control.
             explicit lineage_root_slot(lineage_control* control) noexcept
                     : control_(control) {}
+
+            // Derived construction: acquires a new reference in the base,
+            // before impl_type is constructed. If impl_type ctor throws, the
+            // base destructor releases the already-acquired reference.
+            explicit lineage_root_slot(lineage_construct_tag, lineage_control* control) noexcept
+                    : control_(control) {
+                if (control_) control_->acquire();
+            }
 
             // Copy: acquire a new reference (derived ro / ro copy).
             lineage_root_slot(const lineage_root_slot& rhs) noexcept

@@ -41,7 +41,7 @@ does not need it.
 The design principle is the same one that runs through everything here:
 
 > **Explicit beats implicit.** A bare recipe is single-threaded and free.
-> You say `read_lock` when you mean shared. You call `enable_locking()` when
+> You say `shared` when you mean shared. You call `enable_shared()` when
 > you cross into the multi-threaded world. Nothing is done for you silently,
 > because silent behavior is how C++ gets you.
 
@@ -68,8 +68,10 @@ powers belong to the language, not the library.
 - Read authority (`shared_access`) may be shared — copied freely.
 - Write authority (`exclusive_access`) may only be transferred (move), never
   copied or rebound.
-- Debug builds verify single-lineage provenance and catch use-after-invalidate.
-- The optional `read_lock` decorator provides an intrusive refcount model:
+- Debug builds verify single-lineage provenance, catch use-after-invalidate,
+  and detect orphan readers (bare `borrow_ro` alive during a write) via a
+  Debug-only control block.
+- The optional `shared` decorator provides an intrusive refcount model:
   one atomic counter tracks all live proxies (rw + ro copies). Writing
   requires refcount == 1 (only the rw holder); writing while readers are
   active is a contract violation (always checked — abort in both Debug
@@ -125,7 +127,7 @@ touch it?" — and conflating the two is how ownership bugs happen.
 |---|---|---|
 | What it tracks | lifetime | authority |
 | Write access | everyone | only `exclusive_access` |
-| Cost of a share | atomic RMW (always) | plain copy (bare) or atomic RMW (locked) |
+| Cost of a share | atomic RMW (always) | plain copy (bare) or atomic RMW (shared) |
 | Who can delete | last shared_ptr | last participant (refcount → 0) |
 
 ## Why not a mutex wrapper?
@@ -140,12 +142,12 @@ you asked for:
 | Path | What you pay |
 |---|---|
 | bare recipe | nothing — a store, a load, a member copy |
-| `read_lock` recipe | one atomic RMW per participant add/remove; write is an always-compiled refcount check |
+| `shared` recipe | one atomic RMW per participant add/remove; write is an always-compiled refcount check |
 
 The same `rw->set(7)` expression compiles to a **single store** in both
-bare and locked recipes (Release). The locked recipe adds an
+bare and shared recipes (Release). The shared recipe adds an
 always-compiled `refcount == 1` check (one atomic load) — no CAS, no
-spin, no backoff. The count IS the lock.
+spin, no backoff. The count IS the exclusivity check.
 
 ## Quick start
 
@@ -167,26 +169,29 @@ int main() {
     assert(w.value == 42);
 
     // Borrow a read share. In bare mode this is free (no atomics).
-    // ro MUST die before enable_locking() — the orphan-reader contract.
+    // In Debug, ro MUST die before any write or enable_shared() — the
+    // exclusivity check catches orphan readers. In Release, bare has no
+    // control block; this is the caller's documented contract.
     {
         auto ro = rw.borrow_ro();
         assert(ro->get() == 42);
     }
 
-    // Cross the boundary: enable_locking() starts the shared era (heap control
-    // block, atomics, registry entry). Explicit, one-way, irreversible.
+    // Cross the boundary: enable_shared() starts the participant-count era
+    // (heap control block, atomics, registry entry). Explicit, one-way,
+    // irreversible.
     {
-        auto locked = lease::access::enable_locking(rw);
-        locked->set(7);
+        auto shared_rw = lease::access::enable_shared(rw);
+        shared_rw->set(7);
 
-        auto locked_ro = locked.borrow_ro();   // counted: refcount = 2
-        assert(locked_ro->get() == 7);
-        // locked_ro dies here → refcount back to 1
+        auto shared_ro = shared_rw.borrow_ro();   // counted: refcount = 2
+        assert(shared_ro->get() == 7);
+        // shared_ro dies here → refcount back to 1
     }
-    // locked root is released here; refcount → 0 → control block self-deletes
+    // shared root is released here; refcount → 0 → control block self-deletes
 
     // Multi-threaded from the start: say so explicitly.
-    auto shared = lease::access::make_rw<lease::access::read_lock>(w);
+    auto shared = lease::access::make_rw<lease::access::shared>(w);
     shared->set(9);
 }
 ```
@@ -201,20 +206,23 @@ void write(exclusive_access<widget> rw);        // "I take the authority"
 ### Scoped read/write lambdas
 
 For multi-step mutations (e.g. `std::sort`), use `.write(lambda)` to make
-the write intent visible and prevent references from escaping:
+the write intent visible:
 
 ```cpp
-rw.write([&](std::vector<int>& v) {
+rw.write([](std::vector<int>& v) {
     std::sort(v.begin(), v.end());    // safe: no readers can exist
 });
 
-int first = ro.read([&](const std::vector<int>& v) {
+int first = ro.read([](const std::vector<int>& v) {
     return v.front();                 // const T&, cannot outlive the call
 });
 ```
 
-The lambda receives `T&` (or `const T&` for read). No iterator or pointer
-can escape the scope. `noexcept` propagates from the lambda.
+The lambda receives `T&` (or `const T&` for read). **Contract:** aliases
+to the referent (pointers, references, iterators) must not escape the
+lambda scope. The library cannot prevent a caller from wrapping a
+reference in a struct and storing it — this is a caller obligation, not
+an enforced guarantee. `noexcept` propagates from the lambda.
 
 ### Unified write path
 
@@ -276,42 +284,43 @@ The *shape* is what matters:
 | case | ns/op |
 |---|---|
 | read: lease bare | **1.7** |
-| read: shared_ptr copy | 16.1 |
-| read: lease read_lock | 37.3 |
-| read: std::shared_mutex | 48.8 |
-| write: lease bare | **1.1** |
-| write: lease read_lock | **8.2** |
-| write: std::shared_mutex | 73.8 |
-| root create+destroy: lease | **40.7** |
-| root create+destroy: shared_ptr | 57.7 |
+| read: shared_ptr copy | 15.9 |
+| read: lease shared | 38.5 |
+| read: std::shared_mutex | 49.4 |
+| write: lease bare | **1.2** |
+| write: lease shared | **8.3** |
+| write: std::shared_mutex | 70.2 |
+| root create+destroy: lease | **38.9** |
+| root create+destroy: shared_ptr | 55.8 |
 
-The bare path is within noise of a bare reference. The locked write path is
-**8.2 ns** — 9× faster than `std::shared_mutex` — because the intrusive refcount
-model has no CAS loop, no spin, no backoff. The count IS the lock:
+The bare path is within noise of a bare reference. The shared write path is
+**8.3 ns** — 8× faster than `std::shared_mutex` — because the intrusive refcount
+model has no CAS loop, no spin, no backoff. The count IS the exclusivity check:
 `refcount == 1` means exclusive, always checked.
 
-Root creation+destruction is **40.7 ns** — faster than `std::shared_ptr`
-(57.7 ns) — because `lineage_control` uses a pooled allocator (thread-local
+Root creation+destruction is **38.9 ns** — faster than `std::shared_ptr`
+(55.8 ns) — because `lineage_control` uses a pooled allocator (thread-local
 cache → lock-free slab → malloc fallback) borrowed from flux_foundry.
 
-### Debug checking is real, and it stays out of the hot path
+### Debug checking is real, and it stays out of the Release hot path
 
 `LSE_ACCESS_CHECKING` (on unless `NDEBUG`) tracks root provenance in a
-global registry (single-lineage guarantee). Its cost is a
-**root-lifecycle tax**, not a per-access tax:
+global registry (single-lineage guarantee) and gives bare recipes a
+control block for orphan-reader detection:
 
 | case | release | debug |
 |---|---|---|
-| root create + destroy | 40.7 ns | 1539 ns |
-| read: lease bare | 1.7 ns | 59.1 ns |
-| read: lease read_lock | 37.3 ns | 121.2 ns |
-| write: lease read_lock | 8.2 ns | 56.2 ns |
+| root create + destroy | 38.9 ns | 1517 ns |
+| read: lease bare | 1.7 ns | 140.2 ns |
+| read: lease shared | 38.5 ns | 148.7 ns |
+| write: lease bare | 1.2 ns | 58.9 ns |
+| write: lease shared | 8.3 ns | 58.6 ns |
 
-Creating a root in Debug pays the global mutex + hash map entry; **the hot
-paths are unchanged**. Write exclusivity (`is_exclusive()`) is always
-compiled — a single atomic load, invisible in benchmark noise. The
-Debug-only cost is the root_registry provenance check, not the
-exclusivity check.
+In Debug, bare recipes now pay the same control-block cost as shared recipes
+(orphan-reader detection). **Release is unchanged**: bare stays zero-cost
+(no control block, no atomics), and only shared recipes check exclusivity.
+The Debug-only cost is the root_registry provenance check + the control
+block that bare now carries for contract enforcement.
 
 ## What the compiler refuses (read this, it's the best part)
 
@@ -323,13 +332,13 @@ messages in [`docs/negative_examples.cpp`](docs/negative_examples.cpp).
 auto rw2 = rw;              // ERROR: deleted — write authority is unique
 auto rw2 = std::move(rw);   // OK: transferred, then rw is spent
 shared_access<widget> ro = rw;   // ERROR: no implicit downgrade
-auto again = enable_locking(locked);   // ERROR: static_assert — already locked
+auto again = enable_shared(shared_rw);   // ERROR: static_assert — already shared
 ```
 
 And at runtime (always checked, both Debug and Release):
 
 ```cpp
-make_rw<read_lock>(w); make_ro<read_lock>(w);   // abort: two roots, one object (Debug only)
+make_rw<shared>(w); make_ro<shared>(w);   // abort: two roots, one object (Debug only)
 rw->set(1);  rw->set(1);  // after std::move(rw): abort: spent handle used
 rw->set(1);               // after borrow_ro(): abort: write while readers active
 ```
@@ -375,7 +384,7 @@ lease.hpp                 facade header — the only public entry point
 lease_type_list.hpp       compile-time type-list IR (flat inheritance, O(1)
                           element_at — borrowed from dynabridge/type_list.h)
 lease_storage.hpp         layer 1: intrusive refcount control block, track
-lease_decorators.hpp      layer 2: read_lock, indexed, decorator contract probe
+lease_decorators.hpp      layer 2: shared, indexed, decorator contract probe
                           (the extension point)
 lease_facade.hpp          layer 3: proxies, factories, write_arrow
 tests/                    contract tests and examples

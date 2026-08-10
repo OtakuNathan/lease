@@ -18,7 +18,7 @@
 
 using lease::access::make_rw;
 using lease::access::make_ro;
-using lease::access::read_lock;
+using lease::access::shared;
 using lease::access::shared_access;
 using lease::access::exclusive_access;
 
@@ -92,17 +92,17 @@ void implicit_downgrade() {
 #endif
 
 // ============================================================================
-// 5. Re-locking an already-locked handle  — forbidden by the type system
+// 5. Re-sharing an already-shared handle  — forbidden by the type system
 // ============================================================================
-// lock() exists only on bare recipes (SFINAE). A locked proxy has no lock()
-// member at all, so the attempt fails before the body is even parsed.
+// enable_shared() exists only on bare recipes (SFINAE). A shared proxy has no
+// enable_shared() member at all, so the attempt fails before the body is even parsed.
 #if 0
-void relock() {
+void reshare() {
     widget w;
-    auto rw = make_rw<read_lock>(w);
-    auto again = rw.lock();              // ERROR: no matching function
+    auto rw = make_rw<shared>(w);
+    auto again = enable_shared(rw);     // ERROR: no matching function
     //   note: candidate template ignored: requirement
-    //   '!contains<read_lock, ...>' was not satisfied
+    //   '!contains<shared, ...>' was not satisfied
     (void)again;
 }
 #endif
@@ -115,8 +115,8 @@ void relock() {
 #if 0
 void double_root() {
     widget w;
-    auto rw = make_rw<read_lock>(w);     // registers w as lineage root
-    auto ro = make_ro<read_lock>(w);     // Debug: contract violation
+    auto rw = make_rw<shared>(w);     // registers w as lineage root
+    auto ro = make_ro<shared>(w);     // Debug: contract violation
     //   lease::access contract violation: referent already belongs to
     //   another live proxy lineage   → abort
     (void)rw;
@@ -125,23 +125,21 @@ void double_root() {
 #endif
 
 // ============================================================================
-// 7. Locking with a live orphan reader  — documented contract, not runtime
+// 7. Writing with a live orphan reader  — Debug contract violation
 // ============================================================================
-// A bare reader derived before lock() contributes no count to the locked
-// protocol. Locking while one is alive would create an uncounted participant
-// racing the new writer. This is a *documented* contract, not a runtime
-// check: bare readers are never registered, so the lock path cannot detect
-// them — that is the honest price of the zero-cost path. The caller owns the
-// promise; Debug builds only re-arm provenance checking at lock() itself.
+// In Debug, bare recipes also get a lineage_control block. A bare reader
+// derived via borrow_ro() increments the refcount, so a subsequent write
+// through the rw holder is caught by write_arrow's exclusivity check.
+// In Release, bare recipes have no control block; this is a documented
+// contract (the caller's responsibility).
 #if 0
-void lock_with_live_orphan() {
+void write_with_live_orphan() {
     widget w;
     auto rw = make_rw(w);
-    auto ro = rw.borrow_ro();            // bare reader, zero count
-    // Documented contract: ro must be destroyed before lock().
-    auto locked = rw.lock();             // compiles, runs — caller's promise
+    auto ro = rw.borrow_ro();            // Debug: refcount = 2
+    rw->set(7);                          // Debug: contract violation!
+    //   "write expression while readers are active" → abort
     (void)ro;
-    (void)locked;
 }
 #endif
 

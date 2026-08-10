@@ -10,40 +10,46 @@
 // If T is a span/container/view, the semantics of the objects reachable through T
 // remain T's responsibility. The proxy does not understand size/split/subspan/etc.
 //
-// Locking is a recipe decision, not a facade built-in. Explicit beats implicit:
-//   - a bare recipe (no read_lock) is single-threaded and free: copies need no
-//     counting and writes bypass the atomic word entirely;
-//   - make_ro<read_lock>/make_rw<read_lock> arms the shared era: reader copies
-//     count atomically and writer expressions use CAS exclusion;
-//   - an exclusive_access without read_lock may lock() into a locked one; a
-//     locked exclusive_access can never downgrade (no conversion exists).
+// Sharing is a recipe decision, not a facade built-in. Explicit beats implicit:
+//   - a bare recipe (no `shared`) is single-threaded and free in Release: no
+//     control block, no atomics, no registry entry;
+//   - in Debug, bare recipes also get a lineage_control block so that orphan
+//     readers (borrow_ro alive during a write) are caught as contract violations;
+//   - make_ro<shared>/make_rw<shared> arms the participant-count era: reader copies
+//     count atomically and writer expressions check exclusivity;
+//   - an exclusive_access without `shared` may enable_shared() into a shared one; a
+//     shared exclusive_access can never unshare (no reverse conversion exists).
 //
-// Lazy lineage (shared tax vs. existence tax):
-//   - read_lock roots create lineage_control (heap block + registry entry) at
-//     make_* time; bare roots create nothing — a bare referent only;
-//   - the shared era begins exactly at lock(): that call allocates the
-//     control block, registers the lineage, and starts the reader/writer
-//     protocol. Single-thread code never pays for sharing it does not use.
+// Lazy lineage (Release-only):
+//   - `shared` roots create lineage_control (heap block + registry entry) at
+//     make_* time; bare roots create nothing in Release — a bare referent only;
+//   - in Debug, bare roots also allocate lineage_control for orphan-reader
+//     detection, so the lazy-lineage optimization is Release-only;
+//   - the participant-count era begins exactly at enable_shared() in Release;
+//     in Debug it begins at make_* time (bare already has a control block).
 //
 // Layer structure (all layers live in namespace lease::access):
 //   lease_storage.hpp     — raw storage, lineage control, mandatory track
 //   lease_decorators.hpp  — optional decorators + decorator contract probe
 //                               (this is the EXTENSION POINT of the library)
 //   lease_facade.hpp      — proxy facades, factories, writer exclusion
+//   lease_adapt.hpp       — unified access()/value() adapters for generic code
 //
 // Internally a bare recipe is materialized as:
 //   track_impl<object_storage<T>, Policy>
-// and a user recipe such as make_rw<read_lock>(object) as:
-//   read_lock_impl<track_impl<object_storage<T>, Policy>, Policy>
+// and a user recipe such as make_rw<shared>(object) as:
+//   shared_impl<track_impl<object_storage<T>, Policy>, Policy>
 //
 // C++14 self-contained. Single header (umbrella), zero external dependencies.
 //
-// Lifetime revision:
-//   - each root proxy initially owns lineage_control with std::unique_ptr
-//   - derived/read proxies keep a raw stable control pointer
-//   - root destruction clears root_alive; if readers remain, the last reader
-//     becomes the final closer and deletes the orphaned control block
-//   - no std::shared_ptr/refcount is required
+// Lifetime model (intrusive refcount):
+//   - lineage_control is born with refcount = 1 (the creator's reference)
+//   - every proxy holding a reference calls acquire() (+1) on copy,
+//     release() (-1) on destruction; refcount == 0 → self-delete
+//   - write authority: refcount == 1 means exclusive; > 1 → contract violation
+//   - reentrancy contract: no nested write/borrow_ro/downgrade/move during
+//     an active write expression; lease replaces raw references, so write
+//     lambdas must not capture the rw proxy by reference
 
 #ifndef LEASE_HPP
 #define LEASE_HPP
@@ -217,5 +223,7 @@ namespace lease {
 #include "lease_decorators.hpp"
 // Layer 3: proxy facades, factories, writer exclusion.
 #include "lease_facade.hpp"
+// Layer 4: unified access/value adapters for generic code.
+#include "lease_adapt.hpp"
 
 #endif // LEASE_HPP

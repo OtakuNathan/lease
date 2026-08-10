@@ -30,11 +30,11 @@ bool test_over_capacity() {
     constexpr int N = 256;  // 4x the slab capacity
     std::vector<widget> objs(N);
     {
-        std::vector<exclusive_access<widget, read_lock>> handles;
+        std::vector<exclusive_access<widget, shared>> handles;
         handles.reserve(N);
 
         for (int i = 0; i < N; ++i) {
-            handles.emplace_back(make_rw<read_lock>(objs[i]));
+            handles.emplace_back(make_rw<shared>(objs[i]));
             handles[i]->set(i);
         }
 
@@ -46,11 +46,11 @@ bool test_over_capacity() {
 
     // Re-create to verify pool reuse
     {
-        std::vector<exclusive_access<widget, read_lock>> handles;
+        std::vector<exclusive_access<widget, shared>> handles;
         handles.reserve(N);
 
         for (int i = 0; i < N; ++i) {
-            handles.emplace_back(make_rw<read_lock>(objs[i]));
+            handles.emplace_back(make_rw<shared>(objs[i]));
             handles[i]->set(i * 2);
         }
 
@@ -70,19 +70,19 @@ bool test_cross_thread_last_closer() {
     struct payload { int x = 99; };
     payload p;
 
-    shared_access<payload, read_lock>* ro_ptr = nullptr;
+    shared_access<payload, shared>* ro_ptr = nullptr;
 
-    std::thread producer([&]() {
-        auto rw = make_rw<read_lock>(p);
+    std::thread producer([&ro_ptr, &p]() {
+        auto rw = make_rw<shared>(p);
         auto ro = rw.borrow_ro();  // refcount = 2
-        ro_ptr = new shared_access<payload, read_lock>(std::move(ro));
+        ro_ptr = new shared_access<payload, shared>(std::move(ro));
         // rw dies here: refcount 2->1. ro_ptr holds the last reference.
     });
 
     producer.join();
     assert((*ro_ptr)->x == 99);
 
-    std::thread consumer([&]() {
+    std::thread consumer([&ro_ptr]() {
         // Destroy on a different thread — last closer cross-thread
         delete ro_ptr;
     });
@@ -111,7 +111,7 @@ bool test_mass_thread_churn() {
         threads.emplace_back([&total_ok, t]() {
             item local_obj;
             for (int i = 0; i < ITERS_PER_THREAD; ++i) {
-                auto rw = make_rw<read_lock>(local_obj);
+                auto rw = make_rw<shared>(local_obj);
                 rw->set(t * 1000 + i);
                 {
                     auto ro = rw.borrow_ro();
@@ -143,10 +143,10 @@ bool test_tls_overflow() {
     std::vector<thing> things(N);
     {
         // First batch: create all 512
-        std::vector<exclusive_access<thing, read_lock>> handles;
+        std::vector<exclusive_access<thing, shared>> handles;
         handles.reserve(N);
         for (int i = 0; i < N; ++i) {
-            handles.emplace_back(make_rw<read_lock>(things[i]));
+            handles.emplace_back(make_rw<shared>(things[i]));
             handles[i]->set(i);
         }
         for (int i = 0; i < N; ++i) {
@@ -157,10 +157,10 @@ bool test_tls_overflow() {
 
     {
         // Second batch: re-create (pool reuse)
-        std::vector<exclusive_access<thing, read_lock>> handles;
+        std::vector<exclusive_access<thing, shared>> handles;
         handles.reserve(N);
         for (int i = 0; i < N; ++i) {
-            handles.emplace_back(make_rw<read_lock>(things[i]));
+            handles.emplace_back(make_rw<shared>(things[i]));
             handles[i]->set(i * 10);
         }
         for (int i = 0; i < N; ++i) {
@@ -189,7 +189,7 @@ bool test_concurrent_churn() {
         threads.emplace_back([&nodes, t]() {
             for (int iter = 0; iter < ITERS; ++iter) {
                 int idx = (t * OBJS_PER_THREAD) + (iter % OBJS_PER_THREAD);
-                auto rw = make_rw<read_lock>(nodes[idx]);
+                auto rw = make_rw<shared>(nodes[idx]);
                 rw->counter.fetch_add(1, std::memory_order_relaxed);
             }
         });
@@ -216,7 +216,7 @@ bool test_rapid_cycle() {
 
     constexpr int ITERS = 100000;
     for (int i = 0; i < ITERS; ++i) {
-        auto rw = make_rw<read_lock>(s);
+        auto rw = make_rw<shared>(s);
         rw->set(i);
     }
     assert(s.x == ITERS - 1);
@@ -230,7 +230,7 @@ bool test_borrow_and_revoke() {
     struct config { int port = 8080; };
     config cfg;
 
-    auto rw = make_rw<read_lock>(cfg);
+    auto rw = make_rw<shared>(cfg);
     rw->port = 9090;
 
     auto ro = rw.borrow_ro();  // refcount = 2

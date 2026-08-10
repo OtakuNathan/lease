@@ -20,9 +20,9 @@ namespace demo {
     using lease::access::make_ro;
     using lease::access::make_rw;
     using lease::access::probe;
-    using lease::access::read_lock;
+    using lease::access::shared;
     using lease::access::indexed;
-    using lease::access::enable_locking;
+    using lease::access::enable_shared;
     using lease::access::shared_access;
     using lease::access::exclusive_access;
 
@@ -90,8 +90,8 @@ namespace demo {
 
     using plain_ro = shared_access<widget>;
     using plain_rw = exclusive_access<widget>;
-    using locked_rw = exclusive_access<widget, read_lock>;
-    using locked_ro = shared_access<widget, read_lock>;
+    using locked_rw = exclusive_access<widget, shared>;
+    using locked_ro = shared_access<widget, shared>;
 
     static_assert(std::is_copy_constructible<plain_ro>::value,
                   "shared_access must be copy constructible");
@@ -111,8 +111,8 @@ namespace demo {
 
 // ---- Decorator contract probes ---------------------------------------------
 // Every decorator must satisfy the contract checked by decorator_probe.
-    static_assert(lease::access::decorator_probe<read_lock, widget, lease::access::ro_tag>::value,
-                  "read_lock must satisfy the decorator contract");
+    static_assert(lease::access::decorator_probe<shared, widget, lease::access::ro_tag>::value,
+                  "shared must satisfy the decorator contract");
     static_assert(lease::access::decorator_probe<audit, widget, lease::access::rw_tag>::value,
                   "audit must satisfy the decorator contract");
     static_assert(lease::access::decorator_probe<probe, widget, lease::access::ro_tag>::value,
@@ -154,22 +154,22 @@ namespace demo {
                   "dedup of empty list is empty");
 
 // ---- Recipe contract: explicit beats implicit ------------------------------
-// A bare recipe is single-threaded and free: no read_lock, no atomics, no
-// registry. read_lock is the explicit opt-in for the multi-threaded mode.
+// A bare recipe is single-threaded and free: no shared, no atomics, no
+// registry. shared is the explicit opt-in for the multi-threaded mode.
 
-    static_assert(!lease::access::contains<read_lock,
+    static_assert(!lease::access::contains<shared,
                           shared_access<widget>::decorator_list>::value,
-                  "default shared_access is free (no read_lock)");
-    static_assert(!lease::access::contains<read_lock,
+                  "default shared_access is free (no shared)");
+    static_assert(!lease::access::contains<shared,
                           exclusive_access<widget>::decorator_list>::value,
-                  "default exclusive_access is free (no read_lock)");
+                  "default exclusive_access is free (no shared)");
 
-    static_assert(lease::access::contains<read_lock,
-                          shared_access<widget, read_lock>::decorator_list>::value,
-                  "explicit read_lock shared_access carries read_lock");
-    static_assert(lease::access::contains<read_lock,
+    static_assert(lease::access::contains<shared,
+                          shared_access<widget, shared>::decorator_list>::value,
+                  "explicit shared shared_access carries shared");
+    static_assert(lease::access::contains<shared,
                           locked_rw::decorator_list>::value,
-                  "explicit read_lock exclusive_access carries read_lock");
+                  "explicit shared exclusive_access carries shared");
 
     // Writer exclusion is compiled in/out with the recipe.
     static_assert(std::is_same<
@@ -181,40 +181,41 @@ namespace demo {
                           lease::access::write_arrow<widget, true>>::value,
                   "locked rw write_arrow checks count == 1 in Debug");
 
-    // A bare rw locks into a read_lock rw; the target recipe carries read_lock.
-    // enable_locking is callable on an lvalue (no &&): like unique_ptr::release(),
+    // A bare rw locks into a shared rw; the target recipe carries shared.
+    // enable_shared is callable on an lvalue (no &&): like unique_ptr::release(),
     // the destructive conversion invalidates the source handle in place.
     static_assert(std::is_same<
-                          decltype(lease::access::enable_locking(
+                          decltype(lease::access::enable_shared(
                               std::declval<exclusive_access<widget>&>())),
                           locked_rw>::value,
-                  "bare rw locks into read_lock rw");
+                  "bare rw locks into shared rw");
 
-    // A locked rw can never re-lock: enable_locking() carries a static_assert
+    // A locked rw can never re-lock: enable_shared() carries a static_assert
     // that rejects already-locked proxies, and no reverse conversion exists.
 
     void free_mode_test() {
         widget w;
 
-        // Bare lineage: copies are free (no reader counting) and writes
-        // bypass the atomic word. Single-thread usage by design — the default.
+        // Bare lineage: in Release, copies are free (no reader counting) and
+        // writes bypass the exclusivity check. In Debug, bare also gets a
+        // control block so orphan readers are caught. Single-threaded by design.
         {
             auto rw = make_rw(w);
             rw->set(1);
 
             {
-                auto ro = rw.borrow_ro();       // bare ro: no reader count
-                auto ro2 = ro;                  // free copy
+                auto ro = rw.borrow_ro();       // Debug: refcount counted
+                auto ro2 = ro;                  // counted copy
                 assert(ro->get() == 1);
                 assert(ro2->get() == 1);
+            } // ro/ro2 destroyed — refcount back to 1
 
-                rw->set(2);                     // bare write: no count check
-                assert(ro->get() == 2);         // same referent, readers see it
-            } // ro/ro2 destroyed — orphan-reader contract satisfied before enable_locking
+            rw->set(2);                         // safe: no readers alive
+            assert(w.value == 2);
 
-            // Lock: bare rw -> read_lock rw. Destructive; the old handle hands
+            // Lock: bare rw -> shared rw. Destructive; the old handle hands
             // over root ownership and is invalidated. No std::move needed.
-            auto locked = enable_locking(rw);
+            auto locked = enable_shared(rw);
             assert(!rw);
 
             locked->set(3);                 // locked write: count checked in Debug
@@ -224,18 +225,18 @@ namespace demo {
             assert(locked_ro2->get() == 3);
         } // locked_ro / locked_ro2 and the locked lineage close cleanly here.
 
-        // Bare roots create no lineage control and register nothing, so the
-        // Debug root-registry conflict check does not apply in free mode. That
-        // is the deliberate price of the zero-cost path: the caller owns the
-        // single-lineage promise until lock() re-arms the check.
+        // In Release, bare roots create no lineage control and register nothing.
+        // In Debug, bare roots get a control block (orphan-reader detection).
+        // Either way, after the previous lineage is fully released, a new root
+        // for the same object is valid.
         {
             auto rw = make_rw(w);
             rw->set(4);
             assert(w.value == 4);
         }
 
-        // A bare rw can also downgrade before any lock: the bare referent
-        // transfers, no control block is ever created.
+        // A bare rw can also downgrade: in Debug the control block transfers
+        // to the ro; in Release there is no control block (bare referent only).
         {
             auto rw = make_rw(w);
             rw->set(5);
@@ -259,7 +260,7 @@ namespace demo {
 
     void object_test() {
         widget w;
-        auto rw = make_rw<read_lock, audit>(w);
+        auto rw = make_rw<shared, audit>(w);
 
         rw->set(7);                        // 1st write expression (counted)
         assert(rw.clone().get() == 7);     // read path: not counted
@@ -297,7 +298,7 @@ namespace demo {
         widget w;
 
         {
-            auto rw = make_rw<read_lock>(w);
+            auto rw = make_rw<shared>(w);
             rw->set(31);
             auto ro = rw.borrow_ro();
             auto c = ro.clone();           // must return immediately, no deadlock
@@ -316,15 +317,15 @@ namespace demo {
         std::puts("ro_clone_test OK");
     }
 
-    // The recipe is part of the type: a read_lock rw borrows a read_lock ro.
+    // The recipe is part of the type: a shared rw borrows a shared ro.
     locked_ro reader_outliving_rw(widget& w) {
-        auto rw = make_rw<read_lock>(w);
+        auto rw = make_rw<shared>(w);
         rw->set(21);
         return rw.borrow_ro();
     }
 
     locked_ro reader_copy_outliving_ro_root(widget& w) {
-        auto root = make_ro<read_lock>(w);
+        auto root = make_ro<shared>(w);
         auto copy = root;
         return copy;
     }
@@ -340,7 +341,7 @@ namespace demo {
         // Successful re-registration proves that the orphaned control was deleted
         // and the Debug provenance entry was removed by the last reader.
         {
-            auto rw = make_rw<read_lock>(w);
+            auto rw = make_rw<shared>(w);
             rw->set(22);
         }
 
@@ -350,7 +351,7 @@ namespace demo {
         } // copied reader closes after the original make_ro root has gone.
 
         {
-            auto rw = make_rw<read_lock>(w);
+            auto rw = make_rw<shared>(w);
             rw->set(23);
             assert(rw->get() == 23);
         }
@@ -387,10 +388,10 @@ namespace demo {
 
     void concurrency_test() {
         widget w;
-        // Multi-threading is explicit: only a read_lock recipe may cross
+        // Multi-threading is explicit: only a shared recipe may cross
         // threads. The participant count model: ro copies may be shared across
         // threads freely; writing requires count == 1 (no active readers).
-        auto rw = make_rw<read_lock>(w);
+        auto rw = make_rw<shared>(w);
         rw->set(42);
 
         constexpr int iterations = 20000;
@@ -403,7 +404,7 @@ namespace demo {
 
             std::vector<std::thread> readers;
             for (int t = 0; t < 3; ++t) {
-                readers.emplace_back([&] {
+                readers.emplace_back([&ro, &iterations, &checksum] {
                     for (int i = 0; i < iterations; ++i) {
                         // Each copy adds/removes a participant atomically.
                         auto local_ro = ro;  // copy: count += 1
@@ -521,10 +522,10 @@ namespace demo {
             assert(ro->get() == 42);
         }
 
-        // --- Works with read_lock recipe ---
+        // --- Works with shared recipe ---
         {
             std::vector<int> vals{100, 200, 300};
-            auto rw = make_rw<read_lock, indexed>(vals);
+            auto rw = make_rw<shared, indexed>(vals);
             auto ro = rw.borrow_ro();
             assert(ro[0] == 100);
             assert(ro[1] == 200);
@@ -560,7 +561,7 @@ namespace demo {
 
 // ---- Token security test (Fix #4) ------------------------------------------
 // A decorator with a no-op invalidate() must NOT prevent the proxy from
-// invalidating the source after enable_locking. The proxy owns invalidate()
+// invalidating the source after enable_shared. The proxy owns invalidate()
 // and calls object_storage directly, bypassing all decorators.
     template <typename Inner, typename Policy>
     class noop_invalidate_impl : public Inner {
@@ -590,9 +591,9 @@ namespace demo {
         auto rw = make_rw<noop_invalidate>(w);
         assert(rw);
 
-        // enable_locking must invalidate the source even though the decorator
+        // enable_shared must invalidate the source even though the decorator
         // has a no-op invalidate(). The proxy bypasses decorators.
-        auto locked = enable_locking(rw);
+        auto locked = enable_shared(rw);
         assert(!rw);   // source is dead — object_storage::invalidate() ran
 
         locked->set(100);
@@ -608,14 +609,14 @@ namespace demo {
             widget w;
             auto rw = make_rw(w);
 
-            rw.write([&](widget& w) {
+            rw.write([](widget& w) {
                 w.set(42);
             });
             assert(w.value == 42);
 
             // read on rw (via borrow_ro)
             auto ro = rw.borrow_ro();
-            int val = ro.read([&](const widget& w) {
+            int val = ro.read([](const widget& w) {
                 return w.get();
             });
             assert(val == 42);
@@ -624,10 +625,10 @@ namespace demo {
         // --- locked recipe: write(lambda) checks exclusivity for entire block ---
         {
             std::vector<int> vals{5, 3, 1, 4, 2};
-            auto rw = make_rw<read_lock>(vals);
+            auto rw = make_rw<shared>(vals);
 
             // std::sort inside write(lambda): no readers can exist, safe to mutate.
-            rw.write([&](std::vector<int>& v) {
+            rw.write([](std::vector<int>& v) {
                 std::sort(v.begin(), v.end());
             });
 
@@ -636,7 +637,7 @@ namespace demo {
 
             // read(lambda) on locked ro
             auto ro = rw.borrow_ro();
-            int first = ro.read([&](const std::vector<int>& v) {
+            int first = ro.read([](const std::vector<int>& v) {
                 return v[0];
             });
             assert(first == 1);
@@ -658,11 +659,11 @@ namespace demo {
         {
             widget w;
             w.value = 77;
-            auto rw = make_rw<read_lock>(w);
+            auto rw = make_rw<shared>(w);
 
             bool threw = false;
             try {
-                rw.write([&](widget& w) {
+                rw.write([](widget& w) {
                     w.set(88);
                     throw std::runtime_error("test");
                 });
@@ -685,7 +686,7 @@ namespace demo {
 // proving they traverse the same decorator write seam as operator->.
     void assign_admission_test() {
         widget w;
-        auto rw = make_rw<read_lock, audit>(w);
+        auto rw = make_rw<shared, audit>(w);
 
         // assign() goes through write_arrow → audit counter increments.
         std::size_t before = rw.access_count();
@@ -734,8 +735,9 @@ namespace demo {
         widget w;
         w.value = 77;
 
-        // Bare recipe: write_arrow has Locked=false, no exclusivity check.
-        // But core_valid() still gates mutable_write_object().
+        // Bare recipe: in Release, write_arrow has Shared=false, no exclusivity
+        // check. In Debug, bare also checks exclusivity (control block exists).
+        // Either way, core_valid() still gates mutable_write_object().
         {
             auto rw = make_rw<write_order>(w);
             assert(rw.write_seam_calls() == 0);
@@ -746,7 +748,7 @@ namespace demo {
 
         // Locked recipe: exclusivity check gates the seam.
         {
-            auto rw = make_rw<read_lock, write_order>(w);
+            auto rw = make_rw<shared, write_order>(w);
             assert(rw.write_seam_calls() == 0);
 
             rw->set(2);
@@ -768,6 +770,142 @@ namespace demo {
         std::puts("write_order_test OK");
     }
 
+// ---- access()/value() adapter tests ----------------------------------------
+    void adapt_test() {
+        using lease::access::access;
+        using lease::access::value;
+
+        // ---- access() ----
+
+        // access(mutable value) → T*
+        {
+            int x = 42;
+            int* p = access(x);
+            assert(p == &x);
+            *p = 99;
+            assert(x == 99);
+        }
+
+        // access(const value) → const T*
+        {
+            const int x = 7;
+            const int* p = access(x);
+            assert(p == &x);
+            assert(*p == 7);
+        }
+
+        // access(raw ptr) → T*
+        {
+            int x = 5;
+            int* p = access(&x);
+            assert(p == &x);
+        }
+
+        // access(bare ro) → Cap& → operator-> → const T*
+        {
+            widget w; w.value = 42;
+            auto ro = make_ro(w);
+            auto& cap = access(ro);
+            assert(cap->get() == 42);
+        }
+
+        // access(const bare ro) → const Cap& → operator->() const → const T*
+        // Bug2 regression: const cap must route to capability overload
+        {
+            widget w; w.value = 42;
+            const auto ro = make_ro(w);
+            auto& cap = access(ro);
+            assert(cap->get() == 42);
+        }
+
+        // access(bare rw) → Cap& → operator-> → write_arrow → T*
+        {
+            widget w;
+            auto rw = make_rw(w);
+            auto& cap = access(rw);
+            cap->set(77);
+            assert(w.value == 77);
+        }
+
+        // access(shared ro) → Cap&
+        {
+            widget w; w.value = 42;
+            auto ro = make_ro<shared>(w);
+            auto& cap = access(ro);
+            assert(cap->get() == 42);
+        }
+
+        // access(shared rw) → Cap&
+        {
+            widget w;
+            auto rw = make_rw<shared>(w);
+            auto& cap = access(rw);
+            cap->set(88);
+            assert(w.value == 88);
+        }
+
+        // ---- value() ----
+
+        // value(plain T) → T (pass-through, RVO)
+        {
+            widget w; w.value = 42;
+            auto copy = value(w);
+            assert(copy.get() == 42);
+            copy.value = 99;
+            assert(w.value == 42);
+        }
+
+        // value(bare ro) → T (clone)
+        {
+            widget w; w.value = 42;
+            auto ro = make_ro(w);
+            auto copy = value(ro);
+            assert(copy.get() == 42);
+        }
+
+        // value(bare rw) → T (clone)
+        {
+            widget w; w.value = 42;
+            auto rw = make_rw(w);
+            auto copy = value(rw);
+            assert(copy.get() == 42);
+        }
+
+        // value(shared ro) → T (clone)
+        {
+            widget w; w.value = 42;
+            auto ro = make_ro<shared>(w);
+            auto copy = value(ro);
+            assert(copy.get() == 42);
+        }
+
+        // value(shared rw) → T (clone)
+        {
+            widget w; w.value = 42;
+            auto rw = make_rw<shared>(w);
+            auto copy = value(rw);
+            assert(copy.get() == 42);
+        }
+
+        // ---- Bug1 regression: decorated capabilities ----
+        // value() must deduce for decorated caps where D... passes dedup_t
+        {
+            widget w; w.value = 42;
+            auto ro = make_ro<shared, indexed>(w);
+            auto copy = value(ro);
+            assert(copy.get() == 42);
+        }
+
+        {
+            widget w; w.value = 42;
+            auto rw = make_rw<shared, audit>(w);
+            auto copy = value(rw);
+            assert(copy.get() == 42);
+        }
+
+        std::puts("adapt_test OK");
+    }
+
 } // namespace demo
 
 int main() {
@@ -782,11 +920,12 @@ int main() {
     demo::scoped_lambda_test();
     demo::assign_admission_test();
     demo::write_order_test();
+    demo::adapt_test();
 
 #if LSE_ACCESS_CHECKING && defined(LSE_ACCESS_VIOLATION)
     demo::widget w;
-    auto first = lease::access::make_rw<lease::access::read_lock>(w);
-    auto second = lease::access::make_ro<lease::access::read_lock>(w); // independent root: abort in Debug
+    auto first = lease::access::make_rw<lease::access::shared>(w);
+    auto second = lease::access::make_ro<lease::access::shared>(w); // independent root: abort in Debug
     (void)first;
     (void)second;
 #endif
