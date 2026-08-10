@@ -34,15 +34,19 @@
 //     ro copy             → state COPIED (snapshot at copy time)
 //     proxy move          → state MOVED (source invalidated)
 //
-//   Cross-policy projections (rw → ro) construct FRESH target-side state:
-//     borrow_ro / downgrade → fresh ro-side decorator chain constructed
-//     from (object, control), NOT copied from the rw-side chain.
+//   Capability-shape changes construct FRESH target-side state:
+//     borrow_ro / downgrade → fresh ro-side decorator chain
+//     enable_shared         → fresh shared-recipe decorator chain
+//   Each target is constructed from (object, control), NOT copied or moved
+//   from the source chain. enable_shared remains rw-side, but changes the
+//   concrete recipe and therefore follows the same rule.
 //
-//   This is intentional: rw_tag and ro_tag decorator impls may have
-//   different structures, and a cross-policy conversion seam would create
-//   a cartesian product of copy/move paths. Instead, decorator state
-//   belongs to a concrete capability value. Lineage-wide state (refcount,
-//   exclusivity, provenance) lives entirely in lineage_control +
+//   This is intentional: decorator state may not have equivalent meaning
+//   after a policy or recipe change. A preservation seam would create a
+//   cartesian product of conversion paths and, worse, make preservation
+//   depend on which decorators happen to support it. Instead, decorator
+//   state belongs to one concrete capability value. Lineage-wide state
+//   (refcount, exclusivity, provenance) lives entirely in lineage_control +
 //   lineage_root_slot, never in decorator members.
 //
 //   `mutable` members are allowed (for observation counters on const ro

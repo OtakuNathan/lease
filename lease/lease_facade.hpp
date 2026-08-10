@@ -527,6 +527,9 @@ namespace access {
 // enable_shared: bare exclusive_access -> shared exclusive_access.
 //
 // Destructive: the source proxy is invalidated.
+// The target decorator chain is constructed fresh from (object, control).
+// Decorator state is deliberately not moved across this recipe change; some
+// decorator state has no equivalent meaning once shared mode is enabled.
 //
 // Strong exception guarantee via speculative-acquire pattern:
 //   prepare → construct → commit

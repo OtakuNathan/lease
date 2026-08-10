@@ -235,6 +235,22 @@ namespace demo {
             assert(w.value == 4);
         }
 
+        // A recipe change starts a fresh decorator chain. Even though
+        // enable_shared stays rw-side, per-capability decorator state is not
+        // preserved: not every decorator has an equivalent shared-mode state.
+        {
+            auto rw = make_rw<audit>(w);
+            rw->set(40);
+            assert(rw.access_count() == 1);
+
+            auto locked = enable_shared(rw);
+            assert(!rw);
+            assert(locked.access_count() == 0);
+
+            locked->set(41);
+            assert(locked.access_count() == 1);
+        }
+
         // A bare rw can also downgrade: in Debug the control block transfers
         // to the ro; in Release there is no control block (bare referent only).
         {
