@@ -21,6 +21,7 @@
 #define LEASE_POOL_HPP
 
 #include <atomic>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -210,7 +211,12 @@ namespace access {
 
         void deallocate(void* p) noexcept {
             if (!p) return;
-            free_list_.push(p);
+            // A failed push means the free list is exhausted — only reachable
+            // via double-free or a foreign pointer (contract breach). Never
+            // drop a block silently.
+            assert(free_list_.push(p) &&
+                   "fixed_slab::deallocate: free list exhausted "
+                   "(double free or foreign pointer?)");
         }
 
         bool owns(const void* p) const noexcept {
@@ -326,6 +332,11 @@ namespace access {
 
     public:
         static void* operator new(std::size_t n) {
+            static_assert(std::is_final<T>::value,
+                          "pooling_base: the derived class must be final — a "
+                          "non-final base allows derived allocations whose size "
+                          "differs, routing new/delete through different "
+                          "allocators (cross-allocator corruption)");
             if (n != sizeof(T)) {
                 return ::operator new(n);
             }
@@ -340,6 +351,11 @@ namespace access {
         }
 
         static void* operator new(std::size_t n, const std::nothrow_t&) noexcept {
+            static_assert(std::is_final<T>::value,
+                          "pooling_base: the derived class must be final — a "
+                          "non-final base allows derived allocations whose size "
+                          "differs, routing new/delete through different "
+                          "allocators (cross-allocator corruption)");
             if (n != sizeof(T)) {
                 return ::operator new(n, std::nothrow);
             }
@@ -350,6 +366,11 @@ namespace access {
         }
 
         static void operator delete(void* p) noexcept {
+            static_assert(std::is_final<T>::value,
+                          "pooling_base: the derived class must be final — a "
+                          "non-final base allows derived allocations whose size "
+                          "differs, routing new/delete through different "
+                          "allocators (cross-allocator corruption)");
             if (!p) return;
             constexpr std::size_t align = alignof(std::max_align_t);
             constexpr std::size_t raw = sizeof(T);
