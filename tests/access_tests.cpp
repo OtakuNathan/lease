@@ -922,6 +922,27 @@ namespace demo {
         std::puts("adapt_test OK");
     }
 
+// ---- Static-storage destruction order -------------------------------------
+// A namespace-scope owner is destroyed after any function-local static whose
+// construction it preceded. This global container starts holding proxies
+// during main, i.e. after root_registry (a function-local static created by
+// the first make_* call) completed construction — so the sink is destroyed
+// AFTER the registry, and its handle destructors must still be able to
+// unregister. Without an immortal registry this aborts at process exit with
+// "unregistering unknown proxy lineage"; the failure shows up as a non-zero
+// exit status after every line of main has already been printed.
+    widget g_exit_order_object;                                  // referent: outlives the handles
+    std::vector<shared_access<widget, shared>> g_exit_order_sink;  // owner: destroyed after the registry
+
+    void static_owner_exit_test() {
+        auto root = make_ro<shared>(g_exit_order_object);
+        for (int i = 0; i < 4; ++i) {
+            g_exit_order_sink.push_back(root);
+        }
+        assert(g_exit_order_sink.size() == 4);
+        std::puts("static_owner_exit_test OK (teardown runs after main)");
+    }
+
 } // namespace demo
 
 int main() {
@@ -937,6 +958,7 @@ int main() {
     demo::assign_admission_test();
     demo::write_order_test();
     demo::adapt_test();
+    demo::static_owner_exit_test();
 
 #if LSE_ACCESS_CHECKING && defined(LSE_ACCESS_VIOLATION)
     demo::widget w;

@@ -76,9 +76,18 @@ namespace access {
             }
 
         private:
+            // Deliberately immortal: the registry must outlive every proxy.
+            // Static destruction runs in reverse order of construction
+            // completion, so a static-storage owner constructed *before* the
+            // first proxy (e.g. a global container filled during main) is
+            // destroyed *after* this function-local static — and its handle
+            // destructors would then call release() on a destroyed registry,
+            // aborting at exit with "unregistering unknown proxy lineage".
+            // Leaking one small table (Debug builds only) removes the ordering
+            // dependency instead of relying on luck.
             static root_registry& instance() {
-                static root_registry registry;
-                return registry;
+                static root_registry* registry = new root_registry();
+                return *registry;
             }
 
             std::unordered_map<const void*, const void*> table_;

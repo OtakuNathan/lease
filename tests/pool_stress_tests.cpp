@@ -250,6 +250,49 @@ bool test_borrow_and_revoke() {
 }
 
 // ============================================================
+// Test 8: Slab recycling — a block returned to the slab must come back.
+//
+// fixed_slab::deallocate() used to hide its only side effect inside
+// assert(): with NDEBUG the push was erased, so every block that reached
+// the slab was silently dropped and the pool degraded to the malloc
+// fallback (only the TLS cache's CacheCap blocks stayed reusable).
+// ============================================================
+struct recycle_probe final : pooling_base<recycle_probe, 4> {  // TLS cache cap = 4
+    unsigned char payload[16] = {};
+};
+
+bool test_slab_recycling() {
+    constexpr int N = 64;  // slab capacity (pooling_base hardcodes 64)
+
+    // Round 1: drain the slab completely (cache is empty, so every block
+    // comes from the slab).
+    void* first[N];
+    for (int i = 0; i < N; ++i) {
+        first[i] = new recycle_probe();
+    }
+    // Return them: 4 fill the TLS cache, the other 60 go to the slab.
+    for (int i = 0; i < N; ++i) {
+        delete static_cast<recycle_probe*>(first[i]);
+    }
+
+    // Round 2: every allocation must be a recycled block again.
+    void* second[N];
+    for (int i = 0; i < N; ++i) {
+        second[i] = new recycle_probe();
+    }
+
+    int reused = 0;
+    for (int i = 0; i < N; ++i) {
+        for (int j = 0; j < N; ++j) {
+            if (second[i] == first[j]) { ++reused; break; }
+        }
+    }
+
+    printf("  slab_recycling: %d/%d blocks recycled from the pool\n", reused, N);
+    return reused == N;
+}
+
+// ============================================================
 int main() {
     struct Test { const char* name; bool (*fn)(); };
     Test tests[] = {
@@ -260,6 +303,7 @@ int main() {
         {"concurrent_churn",         test_concurrent_churn},
         {"rapid_cycle",              test_rapid_cycle},
         {"borrow_and_revoke",        test_borrow_and_revoke},
+        {"slab_recycling",           test_slab_recycling},
     };
 
     int passed = 0;

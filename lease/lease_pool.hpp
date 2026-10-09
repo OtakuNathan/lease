@@ -211,12 +211,18 @@ namespace access {
 
         void deallocate(void* p) noexcept {
             if (!p) return;
-            // A failed push means the free list is exhausted — only reachable
-            // via double-free or a foreign pointer (contract breach). Never
-            // drop a block silently.
-            assert(free_list_.push(p) &&
+            // The push is the ONLY side effect that puts the block back into
+            // the pool, so it must never live inside assert(): with NDEBUG the
+            // assert expands to nothing, the block is silently dropped, and
+            // the allocator degrades to the malloc fallback.
+            // Debug: a failed push means the free list is exhausted — only
+            // reachable via double-free or a foreign pointer (contract breach)
+            // — and aborts via the assert below.
+            const bool pushed = free_list_.push(p);
+            assert(pushed &&
                    "fixed_slab::deallocate: free list exhausted "
                    "(double free or foreign pointer?)");
+            (void)pushed;
         }
 
         bool owns(const void* p) const noexcept {
